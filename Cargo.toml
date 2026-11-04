@@ -1,0 +1,25 @@
+[package]
+name = "turbolas"
+version = "0.1.0"
+edition = "2021"
+authors = ["Ravi"]
+license = "MIT"
+description = "Blazing fast LAS (Log ASCII Standard) Python extension powered by Rust"
+repository = "https://github.com/Ravisxcr/turbolas"
+readme = "README.md"
+keywords = ["las", "well-log", "petrophysics", "geology", "parser"]
+
+[lib]
+name = "_turbolas"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["extension-module"] }
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
