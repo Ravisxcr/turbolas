@@ -170,3 +170,122 @@ impl From<StateMachineError> for PyErr {
         LASSectionError::new_err(err.to_string())
     }
 }
+
+/// Errors that can occur during CWLS LAS header line parsing (`MNEM.UNIT VALUE : DESC`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeaderError {
+    /// Line is empty or contains only whitespace.
+    EmptyLine {
+        /// Line number (1-based) where the empty line occurred.
+        line_number: usize,
+    },
+    /// Line is a comment (starts with `#`), not a header record.
+    CommentLine {
+        /// Line number (1-based) where the comment occurred.
+        line_number: usize,
+        /// The raw comment text.
+        line: String,
+    },
+    /// Line is a section delimiter (starts with `~`), not a header record.
+    SectionDelimiterLine {
+        /// Line number (1-based) where the delimiter occurred.
+        line_number: usize,
+        /// The raw section line text.
+        line: String,
+    },
+    /// Line is missing the dot separator `.` between mnemonic and unit.
+    MissingDot {
+        /// Line number (1-based) where the error occurred.
+        line_number: usize,
+        /// The raw line text.
+        line: String,
+    },
+    /// Mnemonic is empty (e.g. line starts with `.`).
+    EmptyMnemonic {
+        /// Line number (1-based) where the error occurred.
+        line_number: usize,
+        /// The raw line text.
+        line: String,
+    },
+    /// Line is missing the colon separator `:` between value and description in strict mode.
+    MissingColon {
+        /// Line number (1-based) where the error occurred.
+        line_number: usize,
+        /// The raw line text.
+        line: String,
+    },
+    /// Invalid mnemonic (e.g. contains forbidden colon `:` or whitespace in strict mode).
+    InvalidMnemonic {
+        /// Line number (1-based) where the error occurred.
+        line_number: usize,
+        /// The extracted mnemonic string.
+        mnemonic: String,
+        /// Explanation of why the mnemonic is invalid.
+        reason: String,
+    },
+}
+
+impl fmt::Display for HeaderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyLine { line_number } => {
+                write!(
+                    f,
+                    "Line {line_number}: header line is empty or whitespace only"
+                )
+            }
+            Self::CommentLine { line_number, line } => {
+                write!(
+                    f,
+                    "Line {line_number}: expected header line, found comment: '{line}'"
+                )
+            }
+            Self::SectionDelimiterLine { line_number, line } => {
+                write!(
+                    f,
+                    "Line {line_number}: expected header line, found section delimiter: '{line}'"
+                )
+            }
+            Self::MissingDot { line_number, line } => {
+                write!(
+                    f,
+                    "Line {line_number}: header line missing required dot '.' delimiter: '{line}'"
+                )
+            }
+            Self::EmptyMnemonic { line_number, line } => {
+                write!(
+                    f,
+                    "Line {line_number}: header line has empty mnemonic before dot '.': '{line}'"
+                )
+            }
+            Self::MissingColon { line_number, line } => {
+                write!(f, "Line {line_number}: header line missing required colon ':' delimiter in strict mode: '{line}'")
+            }
+            Self::InvalidMnemonic {
+                line_number,
+                mnemonic,
+                reason,
+            } => {
+                write!(
+                    f,
+                    "Line {line_number}: invalid mnemonic '{mnemonic}': {reason}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for HeaderError {}
+
+pyo3::create_exception!(
+    turbolas,
+    LASHeaderError,
+    PyValueError,
+    "Exception raised for LAS header line parsing errors."
+);
+
+impl From<HeaderError> for PyErr {
+    fn from(err: HeaderError) -> Self {
+        LASHeaderError::new_err(err.to_string())
+    }
+}

@@ -1,12 +1,14 @@
 //! `TurboLAS` Python Extension.
 
 pub mod error;
+pub mod header;
 pub mod section;
 pub mod state_machine;
 
 use pyo3::prelude::*;
 
-pub use error::{LASSectionError, StateMachineError};
+pub use error::{HeaderError, LASHeaderError, LASSectionError, StateMachineError};
+pub use header::{parse_header_line, HeaderItem, HeaderParser};
 pub use section::{SectionDelimiter, SectionType};
 pub use state_machine::{LineAction, PyLineAction, SectionStateMachine, State, ValidationMode};
 
@@ -21,6 +23,10 @@ fn _turbolas(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ValidationMode>()?;
     m.add_class::<PyLineAction>()?;
     m.add_class::<SectionStateMachine>()?;
+    m.add_class::<HeaderItem>()?;
+    m.add_class::<HeaderParser>()?;
+
+    m.add_function(wrap_pyfunction!(parse_header_line, m)?)?;
 
     // Uppercase aliases for enum variants
     let py = m.py();
@@ -47,6 +53,7 @@ fn _turbolas(m: &Bound<'_, PyModule>) -> PyResult<()> {
     val_cls.setattr("PERMISSIVE", ValidationMode::Permissive)?;
 
     m.add("LASSectionError", py.get_type::<LASSectionError>())?;
+    m.add("LASHeaderError", py.get_type::<LASHeaderError>())?;
 
     Ok(())
 }

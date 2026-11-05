@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::fmt;
 
 use crate::error::StateMachineError;
+use crate::header::HeaderItem;
 use crate::section::{SectionDelimiter, SectionType};
 
 /// FSM state representing the current section context within a LAS file.
@@ -179,19 +180,33 @@ pub enum ValidationMode {
     Permissive,
 }
 
+impl ValidationMode {
+    /// Returns `true` if this is strict validation mode.
+    #[must_use]
+    pub const fn is_strict(&self) -> bool {
+        matches!(self, Self::Strict)
+    }
+
+    /// Returns `true` if this is permissive validation mode.
+    #[must_use]
+    pub const fn is_permissive(&self) -> bool {
+        matches!(self, Self::Permissive)
+    }
+}
+
 #[allow(clippy::trivially_copy_pass_by_ref)]
 #[pymethods]
 impl ValidationMode {
     /// Returns `true` if this is strict mode.
     #[getter]
     fn get_is_strict(&self) -> bool {
-        matches!(self, Self::Strict)
+        self.is_strict()
     }
 
     /// Returns `true` if this is permissive mode.
     #[getter]
     fn get_is_permissive(&self) -> bool {
-        matches!(self, Self::Permissive)
+        self.is_permissive()
     }
 
     fn __repr__(&self) -> String {
@@ -802,6 +817,27 @@ impl SectionStateMachine {
     #[pyo3(name = "reset")]
     fn reset_py(&mut self) {
         self.reset();
+    }
+
+    /// Parses a line as a CWLS header item using the state machine's current validation mode.
+    ///
+    /// # Errors
+    /// Returns `LASSectionError` if called outside of a header section (~V, ~W, ~C, ~P),
+    /// or `LASHeaderError` if the line itself cannot be parsed.
+    pub fn parse_header_line(&self, line: &str) -> PyResult<HeaderItem> {
+        let current_sec = self.current_section().ok_or_else(|| {
+            crate::error::LASSectionError::new_err(
+                "Cannot parse header line: not currently in any section",
+            )
+        })?;
+        if !current_sec.is_header_section() {
+            return Err(crate::error::LASSectionError::new_err(format!(
+                "Cannot parse header line in section ~{} ({}); only header sections (~V, ~W, ~C, ~P) contain header records",
+                current_sec.char_code(),
+                current_sec.name()
+            )));
+        }
+        HeaderItem::parse(line, self.line_number, self.mode).map_err(Into::into)
     }
 
     fn __repr__(&self) -> String {
