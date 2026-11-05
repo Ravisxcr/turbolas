@@ -3,11 +3,30 @@
 from __future__ import annotations
 
 try:
-    from turbolas._turbolas import __version__ as _rust_version
+    from turbolas._turbolas import (
+        LASSectionError,
+        PyLineAction,
+        SectionDelimiter,
+        SectionStateMachine,
+        SectionType,
+        State,
+        ValidationMode,
+    )
+    from turbolas._turbolas import (
+        __version__ as _rust_version,
+    )
 
     __version__: str = _rust_version
 except ImportError:
     __version__ = "0.1.0-dev"
 
-__all__ = ["__version__"]
-
+__all__ = [
+    "LASSectionError",
+    "PyLineAction",
+    "SectionDelimiter",
+    "SectionStateMachine",
+    "SectionType",
+    "State",
+    "ValidationMode",
+    "__version__",
+]
