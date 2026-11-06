@@ -20,6 +20,8 @@ try:
         SectionStateMachine,
         SectionType,
         State,
+        StreamingUnwrapper,
+        UnwrappedRecord,
         ValidationMode,
         cp1252_to_char,
         decode,
@@ -33,6 +35,7 @@ try:
         map_to_nan,
         parse_columnar,
         parse_header_line,
+        unwrap_and_parse,
     )
     from turbolas._turbolas import (
         __version__ as _rust_version,
@@ -59,6 +62,8 @@ __all__ = [
     "SectionStateMachine",
     "SectionType",
     "State",
+    "StreamingUnwrapper",
+    "UnwrappedRecord",
     "ValidationMode",
     "__version__",
     "cp1252_to_char",
@@ -73,4 +78,5 @@ __all__ = [
     "map_to_nan",
     "parse_columnar",
     "parse_header_line",
+    "unwrap_and_parse",
 ]

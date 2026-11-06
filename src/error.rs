@@ -324,6 +324,26 @@ pub enum DataError {
         /// Number of columns parsed before EOF.
         found: usize,
     },
+    /// Wrapped record folded over physical lines encountered excess tokens.
+    WrappedRecordOverflow {
+        /// Line number (1-based) where the logical record started.
+        record_start_line: usize,
+        /// Line number (1-based) where the overflow occurred.
+        line_number: usize,
+        /// Expected channel/column count per record.
+        expected: usize,
+        /// Number of channels found.
+        found: usize,
+    },
+    /// Wrapped record was truncated before reaching expected channel count.
+    WrappedRecordTruncated {
+        /// Line number (1-based) where the logical record started.
+        record_start_line: usize,
+        /// Expected channel count per record.
+        expected: usize,
+        /// Number of channels parsed before truncation.
+        found: usize,
+    },
     /// Data section is empty or contains no numeric values in strict mode.
     EmptyData,
 }
@@ -364,6 +384,27 @@ impl fmt::Display for DataError {
                 write!(
                     f,
                     "End of data reached with incomplete row (expected {expected} columns, found {found})"
+                )
+            }
+            Self::WrappedRecordOverflow {
+                record_start_line,
+                line_number,
+                expected,
+                found,
+            } => {
+                write!(
+                    f,
+                    "Line {line_number}: wrapped record starting at line {record_start_line} exceeded expected {expected} channels (found {found})"
+                )
+            }
+            Self::WrappedRecordTruncated {
+                record_start_line,
+                expected,
+                found,
+            } => {
+                write!(
+                    f,
+                    "Wrapped record starting at line {record_start_line} truncated at end of data (expected {expected} channels, found {found})"
                 )
             }
             Self::EmptyData => {

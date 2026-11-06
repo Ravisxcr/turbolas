@@ -123,6 +123,20 @@ impl ColumnarBuffer {
         }
     }
 
+    /// Constructs a `ColumnarBuffer` directly from raw columns, names, and row count.
+    #[must_use]
+    pub fn from_raw_parts(
+        columns: Vec<Vec<f64>>,
+        column_names: Vec<String>,
+        num_rows: usize,
+    ) -> Self {
+        Self {
+            columns,
+            column_names,
+            num_rows,
+        }
+    }
+
     /// Returns the number of completed rows in the buffer.
     #[must_use]
     pub const fn num_rows(&self) -> usize {
@@ -442,6 +456,17 @@ impl ColumnarParser {
             return Err(DataError::NoColumnsDefined);
         }
 
+        if self.wrapped {
+            let mut unwrapper = crate::unwrapper::StreamingUnwrapper::new(bytes, self.num_columns)
+                .with_column_names(self.column_names.clone())
+                .with_strict(self.strict)
+                .with_allow_commas(self.allow_commas);
+            if let Some(ref sentinel) = self.null_sentinel {
+                unwrapper = unwrapper.with_null_sentinel(sentinel.clone());
+            }
+            return unwrapper.parse_to_columnar();
+        }
+
         let capacity = self.estimate_capacity(bytes.len());
         let mut columns: Vec<Vec<f64>> = (0..self.num_columns)
             .map(|_| Vec::with_capacity(capacity))
@@ -698,10 +723,15 @@ pub fn parse_columnar_with_sentinel(
 #[pyclass(name = "ColumnarBuffer")]
 #[derive(Debug, Clone)]
 pub struct PyColumnarBuffer {
-    inner: ColumnarBuffer,
+    pub(crate) inner: ColumnarBuffer,
 }
 
 impl PyColumnarBuffer {
+    #[must_use]
+    pub fn from_inner(inner: ColumnarBuffer) -> Self {
+        Self { inner }
+    }
+
     fn resolve_index(&self, key: &Bound<'_, PyAny>) -> PyResult<usize> {
         if let Ok(idx) = key.extract::<isize>() {
             let num_cols = self.inner.num_columns() as isize;

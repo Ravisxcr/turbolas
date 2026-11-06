@@ -7,6 +7,7 @@ pub mod header;
 pub mod null;
 pub mod section;
 pub mod state_machine;
+pub mod unwrapper;
 
 use pyo3::prelude::*;
 
@@ -25,6 +26,9 @@ pub use header::{parse_header_line, HeaderItem, HeaderParser};
 pub use null::{is_null, map_from_nan, map_to_nan, NullPolicy, NullSentinel};
 pub use section::{SectionDelimiter, SectionType};
 pub use state_machine::{LineAction, PyLineAction, SectionStateMachine, State, ValidationMode};
+pub use unwrapper::{
+    unwrap_and_parse, PyStreamingUnwrapper, PyUnwrappedRecord, StreamingUnwrapper, UnwrappedRecord,
+};
 
 /// Python module wrapper for `TurboLAS`.
 #[pymodule]
@@ -45,6 +49,8 @@ fn _turbolas(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDecodedBuffer>()?;
     m.add_class::<PyColumnarBuffer>()?;
     m.add_class::<PyColumnarParser>()?;
+    m.add_class::<PyUnwrappedRecord>()?;
+    m.add_class::<PyStreamingUnwrapper>()?;
 
     m.add_function(wrap_pyfunction!(parse_header_line, m)?)?;
     m.add_function(wrap_pyfunction!(map_to_nan, m)?)?;
@@ -58,6 +64,7 @@ fn _turbolas(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(encoding::py_cp1252_to_char, m)?)?;
     m.add_function(wrap_pyfunction!(columnar::py_parse_columnar, m)?)?;
     m.add_function(wrap_pyfunction!(columnar::py_estimate_row_capacity, m)?)?;
+    m.add_function(wrap_pyfunction!(unwrapper::py_unwrap_and_parse, m)?)?;
 
     // Uppercase aliases for enum variants
     let py = m.py();
