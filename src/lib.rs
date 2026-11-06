@@ -1,5 +1,6 @@
 //! `TurboLAS` Python Extension.
 
+pub mod encoding;
 pub mod error;
 pub mod header;
 pub mod null;
@@ -8,6 +9,10 @@ pub mod state_machine;
 
 use pyo3::prelude::*;
 
+pub use encoding::{
+    decode_buffer, decode_cp1252, detect_encoding, is_valid_utf8, DecodedBuffer, Encoding,
+    PyDecodedBuffer,
+};
 pub use error::{HeaderError, LASHeaderError, LASSectionError, StateMachineError};
 pub use header::{parse_header_line, HeaderItem, HeaderParser};
 pub use null::{is_null, map_from_nan, map_to_nan, NullPolicy, NullSentinel};
@@ -29,11 +34,19 @@ fn _turbolas(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<HeaderParser>()?;
     m.add_class::<NullPolicy>()?;
     m.add_class::<NullSentinel>()?;
+    m.add_class::<Encoding>()?;
+    m.add_class::<PyDecodedBuffer>()?;
 
     m.add_function(wrap_pyfunction!(parse_header_line, m)?)?;
     m.add_function(wrap_pyfunction!(map_to_nan, m)?)?;
     m.add_function(wrap_pyfunction!(map_from_nan, m)?)?;
     m.add_function(wrap_pyfunction!(is_null, m)?)?;
+    m.add_function(wrap_pyfunction!(encoding::py_decode_buffer, m)?)?;
+    m.add_function(wrap_pyfunction!(encoding::py_decode, m)?)?;
+    m.add_function(wrap_pyfunction!(encoding::py_detect_encoding, m)?)?;
+    m.add_function(wrap_pyfunction!(encoding::py_is_valid_utf8, m)?)?;
+    m.add_function(wrap_pyfunction!(encoding::py_decode_cp1252, m)?)?;
+    m.add_function(wrap_pyfunction!(encoding::py_cp1252_to_char, m)?)?;
 
     // Uppercase aliases for enum variants
     let py = m.py();
@@ -65,6 +78,16 @@ fn _turbolas(m: &Bound<'_, PyModule>) -> PyResult<()> {
     null_pol_cls.setattr("AGGRESSIVE", NullPolicy::Aggressive)?;
     null_pol_cls.setattr("NONE", NullPolicy::None)?;
     null_pol_cls.setattr("None_", NullPolicy::None)?;
+
+    let enc_cls = py.get_type::<Encoding>();
+    enc_cls.setattr("ASCII", Encoding::Ascii)?;
+    enc_cls.setattr("UTF8", Encoding::Utf8)?;
+    enc_cls.setattr("UTF_8", Encoding::Utf8)?;
+    enc_cls.setattr("UTF8_BOM", Encoding::Utf8Bom)?;
+    enc_cls.setattr("UTF8BOM", Encoding::Utf8Bom)?;
+    enc_cls.setattr("WINDOWS_1252", Encoding::Windows1252)?;
+    enc_cls.setattr("WINDOWS1252", Encoding::Windows1252)?;
+    enc_cls.setattr("CP1252", Encoding::Windows1252)?;
 
     m.add("LASSectionError", py.get_type::<LASSectionError>())?;
     m.add("LASHeaderError", py.get_type::<LASHeaderError>())?;

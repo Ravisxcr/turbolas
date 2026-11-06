@@ -4,6 +4,8 @@ from __future__ import annotations
 
 try:
     from turbolas._turbolas import (
+        DecodedBuffer,
+        Encoding,
         HeaderItem,
         HeaderParser,
         LASHeaderError,
@@ -16,7 +18,13 @@ try:
         SectionType,
         State,
         ValidationMode,
+        cp1252_to_char,
+        decode,
+        decode_buffer,
+        decode_cp1252,
+        detect_encoding,
         is_null,
+        is_valid_utf8,
         map_from_nan,
         map_to_nan,
         parse_header_line,
@@ -30,6 +38,8 @@ except ImportError:
     __version__ = "0.1.0-dev"
 
 __all__ = [
+    "DecodedBuffer",
+    "Encoding",
     "HeaderItem",
     "HeaderParser",
     "LASHeaderError",
@@ -43,7 +53,13 @@ __all__ = [
     "State",
     "ValidationMode",
     "__version__",
+    "cp1252_to_char",
+    "decode",
+    "decode_buffer",
+    "decode_cp1252",
+    "detect_encoding",
     "is_null",
+    "is_valid_utf8",
     "map_from_nan",
     "map_to_nan",
     "parse_header_line",
