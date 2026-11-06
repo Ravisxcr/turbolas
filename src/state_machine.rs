@@ -9,6 +9,7 @@ use std::fmt;
 
 use crate::error::StateMachineError;
 use crate::header::HeaderItem;
+use crate::null::NullSentinel;
 use crate::section::{SectionDelimiter, SectionType};
 
 /// FSM state representing the current section context within a LAS file.
@@ -367,6 +368,10 @@ pub struct SectionStateMachine {
     current_section_line_count: usize,
     /// Delimiter metadata for current active section.
     current_delimiter: Option<SectionDelimiter>,
+    /// Dynamically detected or configured NULL sentinel.
+    null_sentinel: NullSentinel,
+    /// Whether the NULL sentinel was dynamically detected from header records.
+    is_null_detected: bool,
 }
 
 impl Default for SectionStateMachine {
@@ -388,6 +393,8 @@ impl SectionStateMachine {
             total_lines_processed: 0,
             current_section_line_count: 0,
             current_delimiter: None,
+            null_sentinel: NullSentinel::default_cwls(),
+            is_null_detected: false,
         }
     }
 
@@ -467,6 +474,24 @@ impl SectionStateMachine {
     #[must_use]
     pub fn line_count_for_section(&self, section: SectionType) -> usize {
         self.section_line_counts.get(&section).copied().unwrap_or(0)
+    }
+
+    /// Returns a reference to the active `NullSentinel`.
+    #[must_use]
+    pub fn null_sentinel(&self) -> &NullSentinel {
+        &self.null_sentinel
+    }
+
+    /// Returns the current numerical NULL sentinel value.
+    #[must_use]
+    pub fn null_value(&self) -> f64 {
+        self.null_sentinel.value()
+    }
+
+    /// Returns whether the NULL sentinel was dynamically detected.
+    #[must_use]
+    pub const fn is_null_detected(&self) -> bool {
+        self.is_null_detected
     }
 
     /// Returns the current section's delimiter metadata.
@@ -615,6 +640,22 @@ impl SectionStateMachine {
             *counter += 1;
 
             let clean_text = line.trim_end_matches(['\r', '\n']).to_string();
+
+            // Dynamic NULL sentinel detection:
+            if current_sec.is_header_section() {
+                let trimmed = clean_text.trim_start();
+                if trimmed.len() >= 4 && trimmed[..4].eq_ignore_ascii_case("NULL") {
+                    if let Ok(item) =
+                        HeaderItem::parse(&clean_text, self.line_number, ValidationMode::Permissive)
+                    {
+                        if let Some(sentinel) = NullSentinel::from_header_item(&item) {
+                            self.null_sentinel = sentinel;
+                            self.is_null_detected = true;
+                        }
+                    }
+                }
+            }
+
             Ok(LineAction::Content {
                 section: current_sec,
                 text: clean_text,
@@ -680,6 +721,8 @@ impl SectionStateMachine {
         self.seen_sections.clear();
         self.section_line_counts.clear();
         self.current_delimiter = None;
+        self.null_sentinel = NullSentinel::default_cwls();
+        self.is_null_detected = false;
     }
 }
 
@@ -824,7 +867,7 @@ impl SectionStateMachine {
     /// # Errors
     /// Returns `LASSectionError` if called outside of a header section (~V, ~W, ~C, ~P),
     /// or `LASHeaderError` if the line itself cannot be parsed.
-    pub fn parse_header_line(&self, line: &str) -> PyResult<HeaderItem> {
+    pub fn parse_header_line(&mut self, line: &str) -> PyResult<HeaderItem> {
         let current_sec = self.current_section().ok_or_else(|| {
             crate::error::LASSectionError::new_err(
                 "Cannot parse header line: not currently in any section",
@@ -837,7 +880,55 @@ impl SectionStateMachine {
                 current_sec.name()
             )));
         }
-        HeaderItem::parse(line, self.line_number, self.mode).map_err(Into::into)
+        let item = HeaderItem::parse(line, self.line_number, self.mode)?;
+        if let Some(sentinel) = NullSentinel::from_header_item(&item) {
+            self.null_sentinel = sentinel;
+            self.is_null_detected = true;
+        }
+        Ok(item)
+    }
+
+    /// Returns the detected or configured NULL sentinel.
+    #[must_use]
+    #[getter(null_sentinel)]
+    pub fn get_null_sentinel(&self) -> NullSentinel {
+        self.null_sentinel.clone()
+    }
+
+    /// Sets the NULL sentinel.
+    #[setter(null_sentinel)]
+    pub fn set_null_sentinel(&mut self, sentinel: NullSentinel) {
+        self.null_sentinel = sentinel;
+    }
+
+    /// Returns the numerical NULL sentinel value.
+    #[must_use]
+    #[getter(null_value)]
+    pub fn get_null_value(&self) -> f64 {
+        self.null_sentinel.value()
+    }
+
+    /// Returns whether the NULL sentinel was dynamically detected from header records.
+    #[must_use]
+    #[getter(is_null_detected)]
+    pub fn get_is_null_detected(&self) -> bool {
+        self.is_null_detected
+    }
+
+    /// Parses a line of ASCII log numerical data, dynamically mapping NULL sentinels to IEEE 754 NaN.
+    ///
+    /// # Errors
+    /// Returns `LASSectionError` in strict mode if called outside the ASCII data section (`~A`),
+    /// or `PyValueError` if any token cannot be parsed as a float.
+    pub fn parse_data_line(&self, line: &str) -> PyResult<Vec<f64>> {
+        if self.mode.is_strict() && !self.is_in_data_section() {
+            return Err(crate::error::LASSectionError::new_err(
+                "Cannot parse data line: not currently in ASCII data section (~A)",
+            ));
+        }
+        self.null_sentinel
+            .parse_ascii_line(line)
+            .map_err(pyo3::exceptions::PyValueError::new_err)
     }
 
     fn __repr__(&self) -> String {

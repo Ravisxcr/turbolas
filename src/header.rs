@@ -314,6 +314,52 @@ impl HeaderItem {
         }
     }
 
+    /// Returns whether this record defines the NULL sentinel (`mnemonic == "NULL"`).
+    #[must_use]
+    pub fn is_null_record(&self) -> bool {
+        self.mnemonic.eq_ignore_ascii_case("NULL")
+    }
+
+    /// Checks whether this item's value is null according to the provided sentinel
+    /// (or standard CWLS `-999.25` if none provided).
+    #[must_use]
+    pub fn is_null(&self, sentinel: Option<&crate::null::NullSentinel>) -> bool {
+        if self.is_empty_value() {
+            return true;
+        }
+        if let Some(f) = self.as_float() {
+            if let Some(s) = sentinel {
+                s.is_null(f)
+            } else {
+                crate::null::is_null(f, crate::null::DEFAULT_CWLS_NULL)
+            }
+        } else {
+            false
+        }
+    }
+
+    /// Parses the value as `f64`, mapping null sentinels to `f64::NAN`.
+    ///
+    /// Returns `Some(f64::NAN)` if the value is a null sentinel or empty,
+    /// `Some(val)` if it parses to a valid non-null float, or `None` if parsing fails.
+    #[must_use]
+    pub fn as_float_mapped(&self, sentinel: Option<&crate::null::NullSentinel>) -> Option<f64> {
+        if self.is_empty_value() {
+            return Some(f64::NAN);
+        }
+        let f = self.as_float()?;
+        let is_null = if let Some(s) = sentinel {
+            s.is_null(f)
+        } else {
+            crate::null::is_null(f, crate::null::DEFAULT_CWLS_NULL)
+        };
+        if is_null {
+            Some(f64::NAN)
+        } else {
+            Some(f)
+        }
+    }
+
     /// Formats this header item into a standard CWLS LAS line representation.
     #[must_use]
     pub fn format_line(
@@ -450,6 +496,24 @@ impl HeaderItem {
     #[pyo3(name = "unquoted_value")]
     fn py_unquoted_value(&self) -> &str {
         self.unquoted_value()
+    }
+
+    /// Returns whether this record defines the NULL sentinel.
+    #[getter]
+    fn get_is_null_record(&self) -> bool {
+        self.is_null_record()
+    }
+
+    /// Checks whether this item's value is null.
+    #[pyo3(name = "is_null", signature = (sentinel=None))]
+    fn py_is_null(&self, sentinel: Option<&crate::null::NullSentinel>) -> bool {
+        self.is_null(sentinel)
+    }
+
+    /// Parses value as float, mapping null sentinels to IEEE 754 NaN.
+    #[pyo3(name = "as_float_mapped", signature = (sentinel=None))]
+    fn py_as_float_mapped(&self, sentinel: Option<&crate::null::NullSentinel>) -> Option<f64> {
+        self.as_float_mapped(sentinel)
     }
 
     /// Formats the header item back into a CWLS LAS formatted line string.

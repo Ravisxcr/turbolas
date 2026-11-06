@@ -2,6 +2,7 @@
 
 pub mod error;
 pub mod header;
+pub mod null;
 pub mod section;
 pub mod state_machine;
 
@@ -9,6 +10,7 @@ use pyo3::prelude::*;
 
 pub use error::{HeaderError, LASHeaderError, LASSectionError, StateMachineError};
 pub use header::{parse_header_line, HeaderItem, HeaderParser};
+pub use null::{is_null, map_from_nan, map_to_nan, NullPolicy, NullSentinel};
 pub use section::{SectionDelimiter, SectionType};
 pub use state_machine::{LineAction, PyLineAction, SectionStateMachine, State, ValidationMode};
 
@@ -25,8 +27,13 @@ fn _turbolas(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SectionStateMachine>()?;
     m.add_class::<HeaderItem>()?;
     m.add_class::<HeaderParser>()?;
+    m.add_class::<NullPolicy>()?;
+    m.add_class::<NullSentinel>()?;
 
     m.add_function(wrap_pyfunction!(parse_header_line, m)?)?;
+    m.add_function(wrap_pyfunction!(map_to_nan, m)?)?;
+    m.add_function(wrap_pyfunction!(map_from_nan, m)?)?;
+    m.add_function(wrap_pyfunction!(is_null, m)?)?;
 
     // Uppercase aliases for enum variants
     let py = m.py();
@@ -51,6 +58,13 @@ fn _turbolas(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let val_cls = py.get_type::<ValidationMode>();
     val_cls.setattr("STRICT", ValidationMode::Strict)?;
     val_cls.setattr("PERMISSIVE", ValidationMode::Permissive)?;
+
+    let null_pol_cls = py.get_type::<NullPolicy>();
+    null_pol_cls.setattr("STRICT", NullPolicy::Strict)?;
+    null_pol_cls.setattr("COMMON", NullPolicy::Common)?;
+    null_pol_cls.setattr("AGGRESSIVE", NullPolicy::Aggressive)?;
+    null_pol_cls.setattr("NONE", NullPolicy::None)?;
+    null_pol_cls.setattr("None_", NullPolicy::None)?;
 
     m.add("LASSectionError", py.get_type::<LASSectionError>())?;
     m.add("LASHeaderError", py.get_type::<LASHeaderError>())?;
