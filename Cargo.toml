@@ -14,6 +14,7 @@ name = "_turbolas"
 crate-type = ["cdylib"]
 
 [dependencies]
+fast-float = "0.2.0"
 pyo3 = { version = "0.23", features = ["extension-module"] }
 simdutf8 = "0.1.5"
 

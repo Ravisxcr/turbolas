@@ -289,3 +289,101 @@ impl From<HeaderError> for PyErr {
         LASHeaderError::new_err(err.to_string())
     }
 }
+
+/// Errors that can occur during CWLS LAS ASCII log data parsing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DataError {
+    /// Zero columns defined or requested.
+    NoColumnsDefined,
+    /// Invalid float token encountered.
+    InvalidFloat {
+        /// Line number (1-based) where the invalid float occurred.
+        line_number: usize,
+        /// Column index (0-based) where the invalid float occurred.
+        column_index: usize,
+        /// Column name/mnemonic if available.
+        column_name: Option<String>,
+        /// The invalid token text.
+        token: String,
+        /// Detailed explanation of why the float failed to parse.
+        reason: String,
+    },
+    /// Row has fewer or more columns than expected in strict unwrapped mode.
+    ColumnCountMismatch {
+        /// Line number (1-based) where the mismatch occurred.
+        line_number: usize,
+        /// Expected column count.
+        expected: usize,
+        /// Actual columns found on the line.
+        found: usize,
+    },
+    /// Stream ended with an incomplete row (fewer columns than expected).
+    IncompleteRow {
+        /// Expected column count per row.
+        expected: usize,
+        /// Number of columns parsed before EOF.
+        found: usize,
+    },
+    /// Data section is empty or contains no numeric values in strict mode.
+    EmptyData,
+}
+
+impl fmt::Display for DataError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoColumnsDefined => {
+                write!(f, "Cannot parse ASCII log data with 0 columns defined")
+            }
+            Self::InvalidFloat {
+                line_number,
+                column_index,
+                column_name,
+                token,
+                reason,
+            } => {
+                let col_desc = match column_name {
+                    Some(name) => format!("column {column_index} ('{name}')"),
+                    None => format!("column {column_index}"),
+                };
+                write!(
+                    f,
+                    "Line {line_number}, {col_desc}: failed to parse float token '{token}': {reason}"
+                )
+            }
+            Self::ColumnCountMismatch {
+                line_number,
+                expected,
+                found,
+            } => {
+                write!(
+                    f,
+                    "Line {line_number}: column count mismatch (expected {expected} columns, found {found})"
+                )
+            }
+            Self::IncompleteRow { expected, found } => {
+                write!(
+                    f,
+                    "End of data reached with incomplete row (expected {expected} columns, found {found})"
+                )
+            }
+            Self::EmptyData => {
+                write!(f, "ASCII log data section contains no numeric values")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DataError {}
+
+pyo3::create_exception!(
+    turbolas,
+    LASDataError,
+    PyValueError,
+    "Exception raised for LAS ASCII log data parsing errors."
+);
+
+impl From<DataError> for PyErr {
+    fn from(err: DataError) -> Self {
+        LASDataError::new_err(err.to_string())
+    }
+}

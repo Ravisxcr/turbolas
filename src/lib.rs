@@ -1,5 +1,6 @@
 //! `TurboLAS` Python Extension.
 
+pub mod columnar;
 pub mod encoding;
 pub mod error;
 pub mod header;
@@ -9,11 +10,17 @@ pub mod state_machine;
 
 use pyo3::prelude::*;
 
+pub use columnar::{
+    estimate_row_capacity, parse_columnar, parse_columnar_with_sentinel, ColumnarBuffer,
+    ColumnarParser, PyColumnarBuffer, PyColumnarParser,
+};
 pub use encoding::{
     decode_buffer, decode_cp1252, detect_encoding, is_valid_utf8, DecodedBuffer, Encoding,
     PyDecodedBuffer,
 };
-pub use error::{HeaderError, LASHeaderError, LASSectionError, StateMachineError};
+pub use error::{
+    DataError, HeaderError, LASDataError, LASHeaderError, LASSectionError, StateMachineError,
+};
 pub use header::{parse_header_line, HeaderItem, HeaderParser};
 pub use null::{is_null, map_from_nan, map_to_nan, NullPolicy, NullSentinel};
 pub use section::{SectionDelimiter, SectionType};
@@ -36,6 +43,8 @@ fn _turbolas(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<NullSentinel>()?;
     m.add_class::<Encoding>()?;
     m.add_class::<PyDecodedBuffer>()?;
+    m.add_class::<PyColumnarBuffer>()?;
+    m.add_class::<PyColumnarParser>()?;
 
     m.add_function(wrap_pyfunction!(parse_header_line, m)?)?;
     m.add_function(wrap_pyfunction!(map_to_nan, m)?)?;
@@ -47,6 +56,8 @@ fn _turbolas(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(encoding::py_is_valid_utf8, m)?)?;
     m.add_function(wrap_pyfunction!(encoding::py_decode_cp1252, m)?)?;
     m.add_function(wrap_pyfunction!(encoding::py_cp1252_to_char, m)?)?;
+    m.add_function(wrap_pyfunction!(columnar::py_parse_columnar, m)?)?;
+    m.add_function(wrap_pyfunction!(columnar::py_estimate_row_capacity, m)?)?;
 
     // Uppercase aliases for enum variants
     let py = m.py();
@@ -91,6 +102,7 @@ fn _turbolas(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     m.add("LASSectionError", py.get_type::<LASSectionError>())?;
     m.add("LASHeaderError", py.get_type::<LASHeaderError>())?;
+    m.add("LASDataError", py.get_type::<LASDataError>())?;
 
     Ok(())
 }

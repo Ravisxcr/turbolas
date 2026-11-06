@@ -4,10 +4,13 @@ from __future__ import annotations
 
 try:
     from turbolas._turbolas import (
+        ColumnarBuffer,
+        ColumnarParser,
         DecodedBuffer,
         Encoding,
         HeaderItem,
         HeaderParser,
+        LASDataError,
         LASHeaderError,
         LASSectionError,
         NullPolicy,
@@ -23,10 +26,12 @@ try:
         decode_buffer,
         decode_cp1252,
         detect_encoding,
+        estimate_row_capacity,
         is_null,
         is_valid_utf8,
         map_from_nan,
         map_to_nan,
+        parse_columnar,
         parse_header_line,
     )
     from turbolas._turbolas import (
@@ -38,10 +43,13 @@ except ImportError:
     __version__ = "0.1.0-dev"
 
 __all__ = [
+    "ColumnarBuffer",
+    "ColumnarParser",
     "DecodedBuffer",
     "Encoding",
     "HeaderItem",
     "HeaderParser",
+    "LASDataError",
     "LASHeaderError",
     "LASSectionError",
     "NullPolicy",
@@ -58,9 +66,11 @@ __all__ = [
     "decode_buffer",
     "decode_cp1252",
     "detect_encoding",
+    "estimate_row_capacity",
     "is_null",
     "is_valid_utf8",
     "map_from_nan",
     "map_to_nan",
+    "parse_columnar",
     "parse_header_line",
 ]
