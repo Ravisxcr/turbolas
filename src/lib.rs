@@ -10,6 +10,9 @@ pub mod state_machine;
 pub mod unwrapper;
 pub mod well;
 
+#[cfg(test)]
+mod cwls_tests;
+
 use pyo3::prelude::*;
 
 pub use columnar::{
