@@ -8,6 +8,7 @@ pub mod null;
 pub mod section;
 pub mod state_machine;
 pub mod unwrapper;
+pub mod well;
 
 use pyo3::prelude::*;
 
@@ -29,6 +30,7 @@ pub use state_machine::{LineAction, PyLineAction, SectionStateMachine, State, Va
 pub use unwrapper::{
     unwrap_and_parse, PyStreamingUnwrapper, PyUnwrappedRecord, StreamingUnwrapper, UnwrappedRecord,
 };
+pub use well::{read_las, LasCurve, LasWell, OutputFormat};
 
 /// Python module wrapper for `TurboLAS`.
 #[pymodule]
@@ -51,6 +53,9 @@ fn _turbolas(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyColumnarParser>()?;
     m.add_class::<PyUnwrappedRecord>()?;
     m.add_class::<PyStreamingUnwrapper>()?;
+    m.add_class::<OutputFormat>()?;
+    m.add_class::<LasCurve>()?;
+    m.add_class::<LasWell>()?;
 
     m.add_function(wrap_pyfunction!(parse_header_line, m)?)?;
     m.add_function(wrap_pyfunction!(map_to_nan, m)?)?;
@@ -65,6 +70,7 @@ fn _turbolas(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(columnar::py_parse_columnar, m)?)?;
     m.add_function(wrap_pyfunction!(columnar::py_estimate_row_capacity, m)?)?;
     m.add_function(wrap_pyfunction!(unwrapper::py_unwrap_and_parse, m)?)?;
+    m.add_function(wrap_pyfunction!(well::read_las, m)?)?;
 
     // Uppercase aliases for enum variants
     let py = m.py();
@@ -106,6 +112,12 @@ fn _turbolas(m: &Bound<'_, PyModule>) -> PyResult<()> {
     enc_cls.setattr("WINDOWS_1252", Encoding::Windows1252)?;
     enc_cls.setattr("WINDOWS1252", Encoding::Windows1252)?;
     enc_cls.setattr("CP1252", Encoding::Windows1252)?;
+
+    let out_fmt_cls = py.get_type::<OutputFormat>();
+    out_fmt_cls.setattr("NUMPY", OutputFormat::NumPy)?;
+    out_fmt_cls.setattr("ARROW", OutputFormat::Arrow)?;
+    out_fmt_cls.setattr("BYTES", OutputFormat::Bytes)?;
+    out_fmt_cls.setattr("LIST", OutputFormat::List)?;
 
     m.add("LASSectionError", py.get_type::<LASSectionError>())?;
     m.add("LASHeaderError", py.get_type::<LASHeaderError>())?;
