@@ -52,3 +52,7 @@ wheels/
 # Operating System files
 .DS_Store
 Thumbs.db
+
+# Local scratch / test runners
+_main.py
+
