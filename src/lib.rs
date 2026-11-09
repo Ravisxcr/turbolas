@@ -9,6 +9,7 @@ pub mod section;
 pub mod state_machine;
 pub mod unwrapper;
 pub mod well;
+pub mod writer;
 
 #[cfg(test)]
 mod cwls_tests;
@@ -33,7 +34,8 @@ pub use state_machine::{LineAction, PyLineAction, SectionStateMachine, State, Va
 pub use unwrapper::{
     unwrap_and_parse, PyStreamingUnwrapper, PyUnwrappedRecord, StreamingUnwrapper, UnwrappedRecord,
 };
-pub use well::{read_las, LasCurve, LasWell, OutputFormat};
+pub use well::{read_las, write_las, LasCurve, LasWell, OutputFormat};
+pub use writer::{write_las_file, write_las_stream, write_las_string, WriteOptions};
 
 /// Python module wrapper for `TurboLAS`.
 #[pymodule]
@@ -74,6 +76,7 @@ fn _turbolas(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(columnar::py_estimate_row_capacity, m)?)?;
     m.add_function(wrap_pyfunction!(unwrapper::py_unwrap_and_parse, m)?)?;
     m.add_function(wrap_pyfunction!(well::read_las, m)?)?;
+    m.add_function(wrap_pyfunction!(well::write_las, m)?)?;
 
     // Uppercase aliases for enum variants
     let py = m.py();

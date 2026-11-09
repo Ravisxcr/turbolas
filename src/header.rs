@@ -76,7 +76,12 @@ impl<'a> HeaderItemRef<'a> {
         }
 
         // 2. Check for comment line
-        if trimmed_start.starts_with('#') {
+        if trimmed_start.starts_with('#')
+            || (mode.is_permissive()
+                && (trimmed_start.starts_with("//")
+                    || trimmed_start.starts_with("--")
+                    || trimmed_start.starts_with('!')))
+        {
             return Err(HeaderError::CommentLine {
                 line_number,
                 line: clean_line.to_string(),
@@ -91,45 +96,56 @@ impl<'a> HeaderItemRef<'a> {
             });
         }
 
-        // 4. Find dot '.' separating mnemonic and unit
-        let Some(dot_idx) = find_mnemonic_dot(clean_line) else {
-            return Err(HeaderError::MissingDot {
-                line_number,
-                line: clean_line.to_string(),
-            });
+        // 4. Find dot '.' separating mnemonic and unit, or fallback in permissive mode
+        let (mnemonic, unit, rest) = match find_mnemonic_dot(clean_line) {
+            Some(dot_idx) => {
+                let raw_mnemonic = &clean_line[..dot_idx];
+                let mnemonic = raw_mnemonic.trim();
+
+                if mnemonic.is_empty() {
+                    return Err(HeaderError::EmptyMnemonic {
+                        line_number,
+                        line: clean_line.to_string(),
+                    });
+                }
+
+                if mnemonic.contains(':') {
+                    return Err(HeaderError::InvalidMnemonic {
+                        line_number,
+                        mnemonic: mnemonic.to_string(),
+                        reason: "mnemonic cannot contain colon ':'".to_string(),
+                    });
+                }
+
+                if mode.is_strict() && mnemonic.contains(char::is_whitespace) {
+                    return Err(HeaderError::InvalidMnemonic {
+                        line_number,
+                        mnemonic: mnemonic.to_string(),
+                        reason: "mnemonic contains whitespace, forbidden in strict CWLS LAS 2.0"
+                            .to_string(),
+                    });
+                }
+
+                let after_dot = &clean_line[dot_idx + 1..];
+                let (unit, rest) = extract_unit(after_dot);
+                (mnemonic, unit, rest)
+            }
+            None => {
+                if mode.is_permissive() {
+                    let ws_idx = trimmed_start
+                        .find(char::is_whitespace)
+                        .unwrap_or(trimmed_start.len());
+                    let mnemonic = &trimmed_start[..ws_idx];
+                    let rest = &trimmed_start[ws_idx..];
+                    (mnemonic, "", rest)
+                } else {
+                    return Err(HeaderError::MissingDot {
+                        line_number,
+                        line: clean_line.to_string(),
+                    });
+                }
+            }
         };
-
-        // 5. Extract and validate mnemonic
-        let raw_mnemonic = &clean_line[..dot_idx];
-        let mnemonic = raw_mnemonic.trim();
-
-        if mnemonic.is_empty() {
-            return Err(HeaderError::EmptyMnemonic {
-                line_number,
-                line: clean_line.to_string(),
-            });
-        }
-
-        if mnemonic.contains(':') {
-            return Err(HeaderError::InvalidMnemonic {
-                line_number,
-                mnemonic: mnemonic.to_string(),
-                reason: "mnemonic cannot contain colon ':'".to_string(),
-            });
-        }
-
-        if mode.is_strict() && mnemonic.contains(char::is_whitespace) {
-            return Err(HeaderError::InvalidMnemonic {
-                line_number,
-                mnemonic: mnemonic.to_string(),
-                reason: "mnemonic contains whitespace, forbidden in strict CWLS LAS 2.0"
-                    .to_string(),
-            });
-        }
-
-        // 6. Extract unit
-        let after_dot = &clean_line[dot_idx + 1..];
-        let (unit, rest) = extract_unit(after_dot);
 
         // 7. Extract value and description
         let (value, description) = extract_value_and_desc(rest, line_number, clean_line, mode)?;

@@ -13,6 +13,7 @@ use pyo3::prelude::*;
 use std::fmt;
 
 use crate::error::StateMachineError;
+use crate::state_machine::ValidationMode;
 
 /// Enumeration of standard CWLS LAS section types.
 #[pyclass(eq, eq_int)]
@@ -540,7 +541,15 @@ impl SectionDelimiter {
     ///
     /// Returns `StateMachineError::InvalidDelimiter` if the line does not start with `~`
     /// or has no character following `~`.
-    pub fn parse(line: &str, line_number: usize) -> Result<Self, StateMachineError> {
+    /// Parses a line known or suspected to be a section delimiter line with a specific validation mode.
+    ///
+    /// In permissive mode, unrecognized section characters (e.g. `~Z`) or custom headers (e.g. `~P_CALCULATED`)
+    /// are classified as [`SectionType::Other`] with the specified section name rather than returning an error.
+    pub fn parse_with_mode(
+        line: &str,
+        line_number: usize,
+        mode: ValidationMode,
+    ) -> Result<Self, StateMachineError> {
         let trimmed_start = line.trim_start();
         if !trimmed_start.starts_with('~') {
             return Err(StateMachineError::InvalidDelimiter {
@@ -552,7 +561,11 @@ impl SectionDelimiter {
 
         let after_tilde = &trimmed_start[1..];
         let content = after_tilde.trim_start();
-        let Some((section_type, section_name, title)) = parse_section_header(content) else {
+        let clean_raw = line.trim_end_matches(['\r', '\n']).to_string();
+
+        let (section_type, section_name, title) = if let Some(res) = parse_section_header(content) {
+            res
+        } else {
             if content.is_empty() {
                 return Err(StateMachineError::InvalidDelimiter {
                     line_number,
@@ -560,15 +573,23 @@ impl SectionDelimiter {
                     reason: "missing section character after '~'".to_string(),
                 });
             }
-            let first_char = content.chars().next().unwrap_or('?');
-            return Err(StateMachineError::UnknownSection {
-                code: first_char.to_ascii_uppercase(),
-                line_number,
-                raw: line.to_string(),
-            });
+            if mode.is_permissive() {
+                let sec_name = content
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("OTHER")
+                    .trim_start_matches('~')
+                    .to_ascii_uppercase();
+                (SectionType::Other, sec_name, String::new())
+            } else {
+                let first_char = content.chars().next().unwrap_or('?');
+                return Err(StateMachineError::UnknownSection {
+                    code: first_char.to_ascii_uppercase(),
+                    line_number,
+                    raw: line.to_string(),
+                });
+            }
         };
-
-        let clean_raw = line.trim_end_matches(['\r', '\n']).to_string();
 
         Ok(Self {
             section_type,
@@ -577,6 +598,14 @@ impl SectionDelimiter {
             raw_line: clean_raw,
             title,
         })
+    }
+
+    /// Parses a line known or suspected to be a section delimiter line in strict mode.
+    ///
+    /// # Errors
+    /// Returns `StateMachineError` if the line cannot be parsed as a valid delimiter.
+    pub fn parse(line: &str, line_number: usize) -> Result<Self, StateMachineError> {
+        Self::parse_with_mode(line, line_number, ValidationMode::Strict)
     }
 
     /// Attempts to parse `line` as a section delimiter.
@@ -651,11 +680,12 @@ impl SectionDelimiter {
         Self::is_blank_line(line)
     }
 
-    /// Parse a delimiter line.
+    /// Parse a delimiter line with optional validation mode.
     #[staticmethod]
-    #[pyo3(signature = (line, line_number = 1))]
-    fn parse_line(line: &str, line_number: usize) -> PyResult<Self> {
-        Self::parse(line, line_number).map_err(Into::into)
+    #[pyo3(signature = (line, line_number = 1, mode = None))]
+    fn parse_line(line: &str, line_number: usize, mode: Option<ValidationMode>) -> PyResult<Self> {
+        let val_mode = mode.unwrap_or(ValidationMode::Strict);
+        Self::parse_with_mode(line, line_number, val_mode).map_err(Into::into)
     }
 
     fn __repr__(&self) -> String {

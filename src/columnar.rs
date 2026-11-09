@@ -58,26 +58,45 @@ pub fn estimate_row_capacity(bytes_len: usize, num_columns: usize) -> usize {
     (estimated_rows + (estimated_rows / 10)).max(16)
 }
 
-/// Checks whether a non-numeric token represents a standard or declared text NULL sentinel.
+/// Checks whether a non-numeric token represents a standard or declared text NULL sentinel,
+/// or legacy error indicators (e.g. `***`, `ERR`, `BAD`, `ND`, `-`).
 #[must_use]
 pub fn is_text_null_sentinel(token: &[u8], sentinel: Option<&NullSentinel>) -> bool {
-    if token.eq_ignore_ascii_case(b"nan")
-        || token.eq_ignore_ascii_case(b"-nan")
-        || token.eq_ignore_ascii_case(b"+nan")
-        || token.eq_ignore_ascii_case(b"null")
-        || token.eq_ignore_ascii_case(b"(null)")
-        || token.eq_ignore_ascii_case(b"none")
-        || token.eq_ignore_ascii_case(b"na")
-        || token.eq_ignore_ascii_case(b"n/a")
-        || token == b"-"
-        || token == b"?"
+    let t = token.trim_ascii();
+    if t.is_empty() {
+        return true;
+    }
+
+    if t.eq_ignore_ascii_case(b"nan")
+        || t.eq_ignore_ascii_case(b"-nan")
+        || t.eq_ignore_ascii_case(b"+nan")
+        || t.eq_ignore_ascii_case(b"null")
+        || t.eq_ignore_ascii_case(b"(null)")
+        || t.eq_ignore_ascii_case(b"none")
+        || t.eq_ignore_ascii_case(b"na")
+        || t.eq_ignore_ascii_case(b"n/a")
+        || t.eq_ignore_ascii_case(b"#n/a")
+        || t.eq_ignore_ascii_case(b"err")
+        || t.eq_ignore_ascii_case(b"error")
+        || t.eq_ignore_ascii_case(b"bad")
+        || t.eq_ignore_ascii_case(b"off")
+        || t.eq_ignore_ascii_case(b"empty")
+        || t.eq_ignore_ascii_case(b"nd")
+        || t.eq_ignore_ascii_case(b"n.d.")
+        || t.eq_ignore_ascii_case(b"inf")
+        || t.eq_ignore_ascii_case(b"-inf")
+        || t.eq_ignore_ascii_case(b"+inf")
+        || t.eq_ignore_ascii_case(b"infinity")
+        || t == b"-"
+        || t == b"?"
+        || t.iter().all(|&c| c == b'*')
     {
         return true;
     }
 
     if let Some(s) = sentinel {
         if let Some(raw) = s.raw_sentinel() {
-            if token == raw.trim().as_bytes() {
+            if t == raw.trim().as_bytes() {
                 return true;
             }
         }
@@ -86,10 +105,67 @@ pub fn is_text_null_sentinel(token: &[u8], sentinel: Option<&NullSentinel>) -> b
     false
 }
 
-/// Contiguous columnar buffer storing parsed `f64` values per curve.
+/// Column storage variant: either high-performance contiguous `f64` numeric vector
+/// or contiguous `String` text vector.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ColumnData {
+    /// Contiguous vector of 64-bit IEEE 754 floats.
+    Float(Arc<Vec<f64>>),
+    /// Contiguous vector of textual / categorical string values.
+    Text(Arc<Vec<String>>),
+}
+
+impl ColumnData {
+    /// Returns `true` if this column contains floating-point numeric data.
+    #[must_use]
+    pub fn is_float(&self) -> bool {
+        matches!(self, Self::Float(_))
+    }
+
+    /// Returns `true` if this column contains string / categorical text data.
+    #[must_use]
+    pub fn is_text(&self) -> bool {
+        matches!(self, Self::Text(_))
+    }
+
+    /// Returns a slice of floats if this is a float column.
+    #[must_use]
+    pub fn as_float_slice(&self) -> Option<&[f64]> {
+        match self {
+            Self::Float(v) => Some(v.as_slice()),
+            Self::Text(_) => None,
+        }
+    }
+
+    /// Returns a slice of strings if this is a text column.
+    #[must_use]
+    pub fn as_text_slice(&self) -> Option<&[String]> {
+        match self {
+            Self::Text(v) => Some(v.as_slice()),
+            Self::Float(_) => None,
+        }
+    }
+
+    /// Number of elements in this column.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Float(v) => v.len(),
+            Self::Text(v) => v.len(),
+        }
+    }
+
+    /// Whether this column is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Contiguous columnar buffer storing parsed `f64` values and/or string values per curve.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ColumnarBuffer {
-    columns: Vec<Arc<Vec<f64>>>,
+    columns: Vec<ColumnData>,
     column_names: Vec<String>,
     num_rows: usize,
 }
@@ -99,7 +175,7 @@ impl ColumnarBuffer {
     #[must_use]
     pub fn new(num_columns: usize, capacity: usize) -> Self {
         let columns = (0..num_columns)
-            .map(|_| Arc::new(Vec::with_capacity(capacity)))
+            .map(|_| ColumnData::Float(Arc::new(Vec::with_capacity(capacity))))
             .collect();
         let column_names = (0..num_columns).map(|i| format!("COL_{i}")).collect();
         Self {
@@ -114,7 +190,7 @@ impl ColumnarBuffer {
     pub fn with_names(column_names: Vec<String>, capacity: usize) -> Self {
         let num_columns = column_names.len();
         let columns = (0..num_columns)
-            .map(|_| Arc::new(Vec::with_capacity(capacity)))
+            .map(|_| ColumnData::Float(Arc::new(Vec::with_capacity(capacity))))
             .collect();
         Self {
             columns,
@@ -130,7 +206,10 @@ impl ColumnarBuffer {
         column_names: Vec<String>,
         num_rows: usize,
     ) -> Self {
-        let arc_columns = columns.into_iter().map(Arc::new).collect();
+        let arc_columns = columns
+            .into_iter()
+            .map(|c| ColumnData::Float(Arc::new(c)))
+            .collect();
         Self {
             columns: arc_columns,
             column_names,
@@ -142,6 +221,21 @@ impl ColumnarBuffer {
     #[must_use]
     pub fn from_arc_columns(
         columns: Vec<Arc<Vec<f64>>>,
+        column_names: Vec<String>,
+        num_rows: usize,
+    ) -> Self {
+        let arc_columns = columns.into_iter().map(ColumnData::Float).collect();
+        Self {
+            columns: arc_columns,
+            column_names,
+            num_rows,
+        }
+    }
+
+    /// Constructs a `ColumnarBuffer` from heterogeneous `ColumnData` variants.
+    #[must_use]
+    pub fn from_column_data(
+        columns: Vec<ColumnData>,
         column_names: Vec<String>,
         num_rows: usize,
     ) -> Self {
@@ -182,21 +276,54 @@ impl ColumnarBuffer {
         &self.column_names
     }
 
-    /// Returns a slice of the column at the given index, if within bounds.
+    /// Returns a slice of the float column at the given index, if float and within bounds.
     #[must_use]
     pub fn column(&self, index: usize) -> Option<&[f64]> {
-        self.columns.get(index).map(|col| col.as_slice())
+        self.columns.get(index).and_then(ColumnData::as_float_slice)
     }
 
-    /// Returns a shared reference (`Arc`) to the column at the given index, if within bounds.
+    /// Returns a slice of the string column at the given index, if text and within bounds.
+    #[must_use]
+    pub fn column_text(&self, index: usize) -> Option<&[String]> {
+        self.columns.get(index).and_then(ColumnData::as_text_slice)
+    }
+
+    /// Returns whether the column at `index` is a text / string column.
+    #[must_use]
+    pub fn is_string_column(&self, index: usize) -> bool {
+        self.columns.get(index).is_some_and(ColumnData::is_text)
+    }
+
+    /// Returns the [`ColumnData`] entry at the given index.
+    #[must_use]
+    pub fn column_data(&self, index: usize) -> Option<&ColumnData> {
+        self.columns.get(index)
+    }
+
+    /// Returns a shared reference (`Arc`) to the float column, if float.
     #[must_use]
     pub fn column_arc(&self, index: usize) -> Option<Arc<Vec<f64>>> {
-        self.columns.get(index).cloned()
+        match self.columns.get(index)? {
+            ColumnData::Float(v) => Some(v.clone()),
+            ColumnData::Text(_) => None,
+        }
     }
 
-    /// Returns a mutable reference to the column vector at the given index.
+    /// Returns a shared reference (`Arc`) to the text column, if text.
+    #[must_use]
+    pub fn column_text_arc(&self, index: usize) -> Option<Arc<Vec<String>>> {
+        match self.columns.get(index)? {
+            ColumnData::Text(v) => Some(v.clone()),
+            ColumnData::Float(_) => None,
+        }
+    }
+
+    /// Returns a mutable reference to the float column vector at the given index.
     pub fn column_mut(&mut self, index: usize) -> Option<&mut Vec<f64>> {
-        self.columns.get_mut(index).map(Arc::make_mut)
+        match self.columns.get_mut(index)? {
+            ColumnData::Float(v) => Some(Arc::make_mut(v)),
+            ColumnData::Text(_) => None,
+        }
     }
 
     /// Finds the index of a column matching `name` (case-insensitive).
@@ -208,31 +335,60 @@ impl ColumnarBuffer {
             .position(|c| c.eq_ignore_ascii_case(trimmed))
     }
 
-    /// Returns a slice of the column matching `name` (case-insensitive).
+    /// Returns a slice of the float column matching `name` (case-insensitive).
     #[must_use]
     pub fn column_by_name(&self, name: &str) -> Option<&[f64]> {
         self.column_index(name).and_then(|idx| self.column(idx))
     }
 
-    /// Returns all column vectors as a slice of shared vectors.
+    /// Returns a slice of the text column matching `name` (case-insensitive).
     #[must_use]
-    pub fn columns(&self) -> &[Arc<Vec<f64>>] {
+    pub fn column_text_by_name(&self, name: &str) -> Option<&[String]> {
+        self.column_index(name)
+            .and_then(|idx| self.column_text(idx))
+    }
+
+    /// Returns all column variants as a slice.
+    #[must_use]
+    pub fn columns(&self) -> &[ColumnData] {
         &self.columns
     }
 
-    /// Consumes the buffer and returns the inner column vectors.
+    /// Consumes the buffer and returns float vectors (converting text columns to NaNs).
     #[must_use]
     pub fn into_columns(self) -> Vec<Arc<Vec<f64>>> {
         self.columns
+            .into_iter()
+            .map(|col| match col {
+                ColumnData::Float(v) => v,
+                ColumnData::Text(v) => {
+                    let floats: Vec<f64> = v
+                        .iter()
+                        .map(|s| fast_float::parse::<f64, _>(s.as_bytes()).unwrap_or(f64::NAN))
+                        .collect();
+                    Arc::new(floats)
+                }
+            })
+            .collect()
     }
 
-    /// Returns a row across all columns as a new `Vec<f64>`.
+    /// Returns a row across all columns as a new `Vec<f64>` (text cells become `NaN`).
     #[must_use]
     pub fn row(&self, row_idx: usize) -> Option<Vec<f64>> {
         if row_idx >= self.num_rows {
             return None;
         }
-        Some(self.columns.iter().map(|col| col[row_idx]).collect())
+        Some(
+            self.columns
+                .iter()
+                .map(|col| match col {
+                    ColumnData::Float(v) => v[row_idx],
+                    ColumnData::Text(v) => {
+                        fast_float::parse::<f64, _>(v[row_idx].as_bytes()).unwrap_or(f64::NAN)
+                    }
+                })
+                .collect(),
+        )
     }
 
     /// Appends a complete row across all columns.
@@ -245,7 +401,14 @@ impl ColumnarBuffer {
             });
         }
         for (col, &val) in self.columns.iter_mut().zip(row.iter()) {
-            Arc::make_mut(col).push(val);
+            match col {
+                ColumnData::Float(v) => Arc::make_mut(v).push(val),
+                ColumnData::Text(v) => Arc::make_mut(v).push(if val.is_nan() {
+                    String::new()
+                } else {
+                    val.to_string()
+                }),
+            }
         }
         self.num_rows += 1;
         Ok(())
@@ -282,7 +445,14 @@ impl ColumnarBuffer {
         let total_len = self.num_rows.saturating_mul(self.columns.len());
         let mut flat = Vec::with_capacity(total_len);
         for col in &self.columns {
-            flat.extend_from_slice(col);
+            match col {
+                ColumnData::Float(v) => flat.extend_from_slice(v),
+                ColumnData::Text(v) => {
+                    for s in v.iter() {
+                        flat.push(fast_float::parse::<f64, _>(s.as_bytes()).unwrap_or(f64::NAN));
+                    }
+                }
+            }
         }
         flat
     }
@@ -294,7 +464,12 @@ impl ColumnarBuffer {
         let mut flat = Vec::with_capacity(total_len);
         for r in 0..self.num_rows {
             for col in &self.columns {
-                flat.push(col[r]);
+                match col {
+                    ColumnData::Float(v) => flat.push(v[r]),
+                    ColumnData::Text(v) => {
+                        flat.push(fast_float::parse::<f64, _>(v[r].as_bytes()).unwrap_or(f64::NAN));
+                    }
+                }
             }
         }
         flat
@@ -303,8 +478,11 @@ impl ColumnarBuffer {
     /// Counts the number of `NaN` entries in the specified column.
     #[must_use]
     pub fn null_count(&self, col_idx: usize) -> usize {
-        self.column(col_idx)
-            .map_or(0, |col| col.iter().filter(|val| val.is_nan()).count())
+        match self.columns.get(col_idx) {
+            Some(ColumnData::Float(v)) => v.iter().filter(|val| val.is_nan()).count(),
+            Some(ColumnData::Text(v)) => v.iter().filter(|s| s.is_empty()).count(),
+            None => 0,
+        }
     }
 
     /// Computes the minimum and maximum of non-NaN values in the specified column.
@@ -352,6 +530,114 @@ impl ColumnarBuffer {
             Some(sum / (count as f64))
         } else {
             None
+        }
+    }
+
+    /// Exports all columns into a standard Python `dict[str, list[float] | list[str]]`.
+    pub fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let dict = PyDict::new(py);
+        for (i, name) in self.column_names.iter().enumerate() {
+            match &self.columns[i] {
+                ColumnData::Float(col) => {
+                    let py_list = PyList::new(py, col.as_slice())?;
+                    dict.set_item(name, py_list)?;
+                }
+                ColumnData::Text(col) => {
+                    let py_list = PyList::new(py, col.as_slice())?;
+                    dict.set_item(name, py_list)?;
+                }
+            }
+        }
+        Ok(dict)
+    }
+
+    /// Exports numeric columns as a 2D float list `list[list[float]]`.
+    #[must_use]
+    pub fn to_list(&self) -> Vec<Vec<f64>> {
+        self.columns
+            .iter()
+            .map(|col| match col {
+                ColumnData::Float(v) => v.as_ref().clone(),
+                ColumnData::Text(v) => v
+                    .iter()
+                    .map(|s| fast_float::parse::<f64, _>(s.as_bytes()).unwrap_or(f64::NAN))
+                    .collect(),
+            })
+            .collect()
+    }
+}
+
+/// Internal mutable column representation during single-pass token streaming.
+enum MutableColumn {
+    Float(Vec<f64>),
+    Text(Vec<String>),
+}
+
+impl MutableColumn {
+    fn with_capacity(capacity: usize) -> Self {
+        Self::Float(Vec::with_capacity(capacity))
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Float(v) => v.len(),
+            Self::Text(v) => v.len(),
+        }
+    }
+
+    fn push_float(&mut self, val: f64) {
+        match self {
+            Self::Float(v) => v.push(val),
+            Self::Text(v) => {
+                if val.is_nan() {
+                    v.push(String::new());
+                } else {
+                    v.push(val.to_string());
+                }
+            }
+        }
+    }
+
+    fn push_text(&mut self, text: String) {
+        match self {
+            Self::Text(v) => v.push(text),
+            Self::Float(v) => {
+                let mut text_vec: Vec<String> = Vec::with_capacity(v.capacity().max(16));
+                for &f in v.iter() {
+                    if f.is_nan() {
+                        text_vec.push(String::new());
+                    } else {
+                        text_vec.push(f.to_string());
+                    }
+                }
+                text_vec.push(text);
+                *self = Self::Text(text_vec);
+            }
+        }
+    }
+
+    fn push_nan_or_empty(&mut self) {
+        match self {
+            Self::Float(v) => v.push(f64::NAN),
+            Self::Text(v) => v.push(String::new()),
+        }
+    }
+
+    fn pop(&mut self) {
+        match self {
+            Self::Float(v) => {
+                v.pop();
+            }
+            Self::Text(v) => {
+                v.pop();
+            }
+        }
+    }
+
+    fn into_column_data(self) -> ColumnData {
+        match self {
+            Self::Float(v) => ColumnData::Float(Arc::new(v)),
+            Self::Text(v) => ColumnData::Text(Arc::new(v)),
         }
     }
 }
@@ -498,8 +784,8 @@ impl ColumnarParser {
         }
 
         let capacity = self.estimate_capacity(bytes.len());
-        let mut columns: Vec<Vec<f64>> = (0..self.num_columns)
-            .map(|_| Vec::with_capacity(capacity))
+        let mut columns: Vec<MutableColumn> = (0..self.num_columns)
+            .map(|_| MutableColumn::with_capacity(capacity))
             .collect();
 
         let mut pos = 0usize;
@@ -543,7 +829,7 @@ impl ColumnarParser {
                                 .take(self.num_columns)
                                 .skip(values_on_line)
                             {
-                                col.push(f64::NAN);
+                                col.push_nan_or_empty();
                             }
                             col_idx = 0;
                         }
@@ -577,7 +863,7 @@ impl ColumnarParser {
                                 .take(self.num_columns)
                                 .skip(values_on_line)
                             {
-                                col.push(f64::NAN);
+                                col.push_nan_or_empty();
                             }
                             col_idx = 0;
                         }
@@ -603,61 +889,88 @@ impl ColumnarParser {
                 break;
             }
 
-            // 7. Numeric token window
-            let token_start = pos;
-            while pos < len {
-                let tb = bytes[pos];
-                if tb == b' '
-                    || tb == b'\t'
-                    || tb == b'\r'
-                    || tb == b'\n'
-                    || tb == b'#'
-                    || (self.allow_commas && tb == b',')
-                {
-                    break;
-                }
+            // 7. Token extraction: support both unquoted tokens and quoted strings ("..." or '...')
+            let is_quote = b == b'"' || b == b'\'';
+            let (token_bytes, is_quoted_token) = if is_quote {
+                let quote_char = b;
                 pos += 1;
-            }
-
-            let token_bytes = &bytes[token_start..pos];
-            at_line_start = false;
-
-            // Direct parse using fast_float Eisel-Lemire algorithm
-            let mut val = match fast_float::parse::<f64, _>(token_bytes) {
-                Ok(v) => v,
-                Err(_) => {
-                    // Check if token represents null/nan text
-                    if is_text_null_sentinel(token_bytes, self.null_sentinel.as_ref()) {
-                        f64::NAN
-                    } else {
-                        let col_name = self.column_names.get(col_idx).cloned();
-                        let token_str = String::from_utf8_lossy(token_bytes).into_owned();
-                        return Err(DataError::InvalidFloat {
-                            line_number,
-                            column_index: col_idx,
-                            column_name: col_name,
-                            token: token_str,
-                            reason: "failed to parse floating-point value".to_string(),
-                        });
-                    }
+                let token_start = pos;
+                while pos < len
+                    && bytes[pos] != quote_char
+                    && bytes[pos] != b'\r'
+                    && bytes[pos] != b'\n'
+                {
+                    pos += 1;
                 }
+                let tb = &bytes[token_start..pos];
+                if pos < len && bytes[pos] == quote_char {
+                    pos += 1; // skip closing quote
+                }
+                (tb, true)
+            } else {
+                let token_start = pos;
+                while pos < len {
+                    let tb = bytes[pos];
+                    if tb == b' '
+                        || tb == b'\t'
+                        || tb == b'\r'
+                        || tb == b'\n'
+                        || tb == b'#'
+                        || (self.allow_commas && tb == b',')
+                    {
+                        break;
+                    }
+                    pos += 1;
+                }
+                (&bytes[token_start..pos], false)
             };
 
-            // Map null sentinel to IEEE 754 NaN
-            if !val.is_nan() {
-                if let Some(ref sentinel) = self.null_sentinel {
-                    if sentinel.is_null(val) {
-                        val = f64::NAN;
+            at_line_start = false;
+
+            if col_idx < self.num_columns {
+                if is_quoted_token {
+                    let text = String::from_utf8_lossy(token_bytes).into_owned();
+                    columns[col_idx].push_text(text);
+                } else {
+                    // Try exact floating-point parse via fast_float
+                    match fast_float::parse::<f64, _>(token_bytes) {
+                        Ok(mut val) => {
+                            if !val.is_nan() {
+                                if let Some(ref sentinel) = self.null_sentinel {
+                                    if sentinel.is_null(val) {
+                                        val = f64::NAN;
+                                    }
+                                }
+                            }
+                            columns[col_idx].push_float(val);
+                        }
+                        Err(_) => {
+                            if is_text_null_sentinel(token_bytes, self.null_sentinel.as_ref()) {
+                                columns[col_idx].push_nan_or_empty();
+                            } else if !self.strict || self.allow_commas {
+                                // Permissive mode or LAS 3.0: treat as textual column!
+                                let text = String::from_utf8_lossy(token_bytes).into_owned();
+                                columns[col_idx].push_text(text);
+                            } else {
+                                let col_name = self.column_names.get(col_idx).cloned();
+                                let token_str = String::from_utf8_lossy(token_bytes).into_owned();
+                                return Err(DataError::InvalidFloat {
+                                    line_number,
+                                    column_index: col_idx,
+                                    column_name: col_name,
+                                    token: token_str,
+                                    reason: "failed to parse floating-point value".to_string(),
+                                });
+                            }
+                        }
                     }
                 }
+                col_idx += 1;
             }
 
-            // Write directly into contiguous column vector
-            columns[col_idx].push(val);
-            col_idx += 1;
             values_on_line += 1;
 
-            if col_idx == self.num_columns {
+            if values_on_line == self.num_columns {
                 col_idx = 0;
             }
         }
@@ -678,7 +991,7 @@ impl ColumnarParser {
                     .take(self.num_columns)
                     .skip(values_on_line)
                 {
-                    col.push(f64::NAN);
+                    col.push_nan_or_empty();
                 }
                 col_idx = 0;
             }
@@ -714,10 +1027,13 @@ impl ColumnarParser {
             (0..self.num_columns).map(|i| format!("COL_{i}")).collect()
         };
 
-        let arc_columns = columns.into_iter().map(Arc::new).collect();
+        let col_data: Vec<ColumnData> = columns
+            .into_iter()
+            .map(MutableColumn::into_column_data)
+            .collect();
         Ok((
             ColumnarBuffer {
-                columns: arc_columns,
+                columns: col_data,
                 column_names: names,
                 num_rows,
             },
@@ -863,16 +1179,28 @@ impl PyColumnarBuffer {
         })
     }
 
-    /// Exports all columns to a dictionary mapping column names to lists of floats in column order.
+    /// Exports all columns to a dictionary mapping column names to lists of values in column order.
     pub fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let dict = PyDict::new(py);
-        for (idx, name) in self.inner.column_names().iter().enumerate() {
-            if let Some(col) = self.inner.column(idx) {
-                let py_list = PyList::new(py, col)?;
-                dict.set_item(name, py_list)?;
-            }
-        }
-        Ok(dict)
+        self.inner.to_dict(py)
+    }
+
+    /// Returns whether the specified column contains string / categorical text data.
+    #[pyo3(signature = (key))]
+    pub fn is_string_column(&self, key: &Bound<'_, PyAny>) -> PyResult<bool> {
+        let idx = self.resolve_index(key)?;
+        Ok(self.inner.is_string_column(idx))
+    }
+
+    /// Returns a column as a Python list of strings if it contains string data.
+    #[pyo3(signature = (key))]
+    pub fn column_text(&self, key: &Bound<'_, PyAny>) -> PyResult<Option<Vec<String>>> {
+        let idx = self.resolve_index(key)?;
+        Ok(self.inner.column_text(idx).map(<[String]>::to_vec))
+    }
+
+    /// Exports numeric columns as a 2D float list `list[list[float]]`.
+    pub fn to_list(&self) -> Vec<Vec<f64>> {
+        self.inner.to_list()
     }
 
     /// Counts the number of `NaN` / missing values in the specified column.
@@ -1008,17 +1336,6 @@ impl PyColumnarBuffer {
         }
         let matrix = np.call_method1("column_stack", (col_arrays,))?;
         Ok(matrix.into())
-    }
-
-    /// Exports all columns to a list of float lists.
-    pub fn to_list(&self) -> Vec<Vec<f64>> {
-        let mut list = Vec::with_capacity(self.inner.num_columns());
-        for idx in 0..self.inner.num_columns() {
-            if let Some(col) = self.inner.column(idx) {
-                list.push(col.to_vec());
-            }
-        }
-        list
     }
 
     pub fn __len__(&self) -> usize {

@@ -679,7 +679,7 @@ impl SectionStateMachine {
 
         // Check if section delimiter line
         if SectionDelimiter::is_delimiter_line(line) {
-            let delimiter = SectionDelimiter::parse(line, self.line_number)?;
+            let delimiter = SectionDelimiter::parse_with_mode(line, self.line_number, self.mode)?;
             let section = delimiter.section_type();
             self.transition(delimiter.clone())?;
             return Ok(LineAction::SectionStart { section, delimiter });

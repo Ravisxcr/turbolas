@@ -49,6 +49,9 @@ try:
     from turbolas._turbolas import (
         read_las as _rust_read_las,
     )
+    from turbolas._turbolas import (
+        write_las as _rust_write_las,
+    )
 
     __version__: str = _rust_version
 except ImportError:
@@ -94,6 +97,48 @@ def read_las(
     )
 
 
+read = read_las
+
+
+def write(
+    well: LasWell,
+    destination: str | os.PathLike[str] | None = None,
+    version: float = 2.0,
+    wrap: bool = False,
+    delimiter: str | None = None,
+    float_precision: int = 4,
+    null_value: float | None = None,
+) -> str | None:
+    """Serializes a `LasWell` instance to a CWLS LAS file or formatted text string.
+
+    Args:
+        well: The `LasWell` object to serialize.
+        destination: Filepath to write to, or None to return the LAS content as a string.
+        version: Target CWLS LAS version (1.2, 2.0, or 3.0). Default is 2.0.
+        wrap: Whether to wrap records across multiple lines (`WRAP. YES`). Default is False.
+        delimiter: Delimiter for LAS 3.0 data columns ("SPACE", "COMMA", "TAB").
+        float_precision: Decimal places for floating-point values. Default is 4.
+        null_value: Sentinel value to write when a float is NaN (defaults to well
+            null or -999.25).
+
+    Returns:
+        String content if destination is None, or None if written to file.
+    """
+    dest_str: str | None = str(destination) if isinstance(destination, os.PathLike) else destination
+    return _rust_write_las(
+        well,
+        destination=dest_str,
+        version=version,
+        wrap=wrap,
+        delimiter=delimiter,
+        float_precision=float_precision,
+        null_value=null_value,
+    )
+
+
+write_las = write
+
+
 __all__ = [
     "ColumnarBuffer",
     "ColumnarParser",
@@ -130,6 +175,9 @@ __all__ = [
     "map_to_nan",
     "parse_columnar",
     "parse_header_line",
+    "read",
     "read_las",
     "unwrap_and_parse",
+    "write",
+    "write_las",
 ]

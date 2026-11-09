@@ -122,20 +122,49 @@ import turbolas
 
 well = turbolas.read("well.las")
 
-# Native Python dictionary: dict[str, list[float]]
+# Native Python dictionary: dict[str, list[float] | list[str]]
 data_dict = well.to_dict()
 
-# Native 2D Python list: list[list[float]] (columns)
+# Native 2D Python list: list[list[float]] (numeric columns)
 data_columns = well.to_list()
 ```
 
 ---
 
-## CWLS LAS 3.0 Support
+## Fast Rust-Backed LAS Writer
 
-CWLS LAS 3.0 introduces compound sections, custom delimiters, and multiple data sets (e.g. Wireline Log, Core, Inclinometry):
+TurboLAS provides an ultra-fast buffered writer (`BufWriter`) capable of exporting wells to standard CWLS LAS 1.2, 2.0, or 3.0 text files or strings:
 
 ```python
+import turbolas
+
+well = turbolas.read("path/to/input.las")
+
+# Serialize directly to a formatted string
+las_str = well.write(version=2.0)
+
+# Or write to a file path with custom formatting options
+turbolas.write(
+    well,
+    "path/to/output.las",
+    version=2.0,
+    wrap=False,  # Wrap data lines (WRAP. YES)
+    float_precision=4,  # Decimal places for float curves
+    null_value=-999.25,  # Custom null sentinel value
+)
+
+# Export as CWLS LAS 3.0 with custom delimiter
+turbolas.write(well, "output_las3.las", version=3.0, delimiter="COMMA")
+```
+
+---
+
+## CWLS LAS 3.0 Support & Categorical Curves
+
+CWLS LAS 3.0 introduces compound sections, custom delimiters, multiple data sets, and textual curves (e.g. Lithology, Stratigraphy, Core descriptions):
+
+```python
+import polars as pl
 import turbolas
 
 well = turbolas.read("las3_file.las")
@@ -144,12 +173,44 @@ if well.is_las3:
     print(f"LAS 3.0 Delimiter: {well.delimiter}")
     print(f"Available sections: {well.section_names}")
 
+    # Textual / categorical curve support
+    lith_curve = well.curves["LITH"]
+    if lith_curve.is_string:
+        descriptions = lith_curve.string_data()  # list[str]
+        print(descriptions[:5])  # ['SANDSTONE', 'SHALE', 'LIMESTONE', ...]
+
+    # Direct ingestion into Polars preserves pl.String type
+    df = pl.DataFrame(well.to_dict())
+    print(df.schema)  # {'DEPT': Float64, 'LITH': String, 'GR': Float64}
+
     # Access secondary sections (e.g., Core data)
     if well.has_section("CORE"):
         core_curves = well.section_curves("CORE")
-        core_data = well.section_data("CORE")  # dict[str, list[float]]
+        core_data = well.section_data("CORE")  # dict[str, list[float] | list[str]]
         print(f"Core section curves: {core_curves}")
 ```
+
+---
+
+## Resilient Permissive Parsing (Dirty Header Recovery)
+
+Real-world historical well log files often violate official CWLS standards. TurboLAS includes robust permissive heuristics that gracefully recover from common corruptions:
+
+```python
+from turbolas import ValidationMode
+import turbolas
+
+# Read malformed or non-compliant legacy files
+well = turbolas.read("corrupt_legacy.las", mode=ValidationMode.PERMISSIVE)
+```
+
+**Permissive recovery features**:
+- **Missing Dot in Mnemonics**: Handles lines like `WELL ACME #1 : Well Name`.
+- **Missing Colons**: Gracefully parses lines omitting the `:` description separator.
+- **Corrupt & Asterisk Data Tokens**: Automatically converts `***`, `****`, `ERR`, `BAD`, `ND`, `#N/A`, `-`, `?` into `NaN`.
+- **Non-Standard Comments & Delimiters**: Accepts `//`, `--`, `!` comments and spaces after `~` (e.g. `~ WELL INFORMATION`).
+- **Duplicate Mnemonics**: Resolves duplicate curve names using indexed suffixes (`GR`, `GR_2`).
+- **Header-less `~A` Data**: Extracts curve definitions embedded directly on the `~A` line.
 
 ---
 
@@ -163,13 +224,13 @@ cargo test --target-dir target
 cargo clippy --target-dir target --all-targets
 cargo fmt --all --check
 
-# Python tests (189 pytest tests)
+# Python tests (201 pytest tests)
 pytest
 
 # Python linter & type checks
 ruff check .
 ruff format --check .
-mypy python/turbolas
+mypy python/turbolas tests
 ```
 
 ---

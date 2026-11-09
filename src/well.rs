@@ -80,11 +80,12 @@ pub struct LasCurve {
     description: String,
     column_index: usize,
     data: Arc<Vec<f64>>,
+    text_data: Option<Arc<Vec<String>>>,
     output_format: OutputFormat,
 }
 
 impl LasCurve {
-    /// Creates a new `LasCurve` instance.
+    /// Creates a new numeric `LasCurve` instance.
     #[must_use]
     pub fn new(
         mnemonic: impl Into<String>,
@@ -101,6 +102,30 @@ impl LasCurve {
             description: description.into(),
             column_index,
             data: data.into(),
+            text_data: None,
+            output_format: OutputFormat::NumPy,
+        }
+    }
+
+    /// Creates a new `LasCurve` instance with optional text data.
+    #[must_use]
+    pub fn new_with_text(
+        mnemonic: impl Into<String>,
+        unit: impl Into<String>,
+        value: impl Into<String>,
+        description: impl Into<String>,
+        column_index: usize,
+        data: impl Into<Arc<Vec<f64>>>,
+        text_data: Option<Arc<Vec<String>>>,
+    ) -> Self {
+        Self {
+            mnemonic: mnemonic.into(),
+            unit: unit.into(),
+            value: value.into(),
+            description: description.into(),
+            column_index,
+            data: data.into(),
+            text_data,
             output_format: OutputFormat::NumPy,
         }
     }
@@ -127,6 +152,17 @@ impl LasCurve {
         data: Vec<f64>,
     ) -> Self {
         Self::new(mnemonic, unit, value, description, column_index, data)
+    }
+
+    /// Whether this curve contains string / categorical text data.
+    #[getter]
+    pub fn is_string(&self) -> bool {
+        self.text_data.is_some()
+    }
+
+    /// Returns a list of strings if this is a text curve.
+    pub fn string_data(&self) -> Option<Vec<String>> {
+        self.text_data.as_ref().map(|v| v.as_ref().clone())
     }
     /// Curve mnemonic identifier (e.g. `"GR"`, `"DEPT"`).
     #[getter]
@@ -208,22 +244,33 @@ impl LasCurve {
     /// Number of sample rows in this curve.
     #[getter]
     pub fn num_rows(&self) -> usize {
-        self.data.len()
+        if let Some(ref t) = self.text_data {
+            t.len()
+        } else {
+            self.data.len()
+        }
     }
 
     /// Shape of the curve vector as a tuple `(num_rows,)`.
     #[getter]
     pub fn shape(&self) -> (usize,) {
-        (self.data.len(),)
+        (self.num_rows(),)
     }
 
-    /// Number of `NaN` / missing values in this curve.
+    /// Number of missing values (NaN for floats, empty strings for text) in this curve.
     pub fn null_count(&self) -> usize {
-        self.data.iter().filter(|v| v.is_nan()).count()
+        if let Some(ref t) = self.text_data {
+            t.iter().filter(|s| s.is_empty()).count()
+        } else {
+            self.data.iter().filter(|v| v.is_nan()).count()
+        }
     }
 
     /// Computes `(min, max)` of non-NaN values in this curve.
     pub fn min_max(&self) -> Option<(f64, f64)> {
+        if self.is_string() {
+            return None;
+        }
         let mut min = f64::INFINITY;
         let mut max = f64::NEG_INFINITY;
         let mut found = false;
@@ -247,6 +294,9 @@ impl LasCurve {
 
     /// Computes the arithmetic mean of non-NaN values in this curve.
     pub fn mean(&self) -> Option<f64> {
+        if self.is_string() {
+            return None;
+        }
         let mut sum = 0.0;
         let mut count = 0usize;
         for &val in self.data.iter() {
@@ -264,7 +314,12 @@ impl LasCurve {
 
     /// Returns the raw contiguous float data as a Python `bytes` object (IEEE 754 little-endian).
     #[allow(unsafe_code)]
-    pub fn as_bytes<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+    pub fn as_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        if self.is_string() {
+            return Err(PyTypeError::new_err(
+                "Cannot export string curve as float64 bytes",
+            ));
+        }
         // SAFETY: self.data is a valid contiguous [f64].
         let byte_slice = unsafe {
             std::slice::from_raw_parts(
@@ -272,38 +327,52 @@ impl LasCurve {
                 self.data.len().saturating_mul(std::mem::size_of::<f64>()),
             )
         };
-        PyBytes::new(py, byte_slice)
+        Ok(PyBytes::new(py, byte_slice))
     }
 
     /// Exports curve data as a zero-copy 1D NumPy array view.
     pub fn to_numpy(&self, py: Python<'_>) -> PyResult<PyObject> {
+        if let Some(ref text_vec) = self.text_data {
+            let py_list = PyList::new(py, text_vec.as_slice())?;
+            return Ok(py_list.into());
+        }
         let np = py.import("numpy")?;
         let dtype = np.getattr("float64")?;
-        let py_bytes = self.as_bytes(py);
+        let py_bytes = self.as_bytes(py)?;
         let arr = np.call_method1("frombuffer", (py_bytes, &dtype))?;
         Ok(arr.into())
     }
 
     /// Exports curve data as a zero-copy Python `memoryview`.
     pub fn as_memoryview<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyMemoryView>> {
-        let py_bytes = self.as_bytes(py);
+        let py_bytes = self.as_bytes(py)?;
         PyMemoryView::from(&py_bytes)
     }
 
     /// Exports curve data as a Python `list[float]`.
     pub fn to_list(&self) -> Vec<f64> {
-        self.data.to_vec()
+        if let Some(ref t) = self.text_data {
+            t.iter()
+                .map(|s| fast_float::parse::<f64, _>(s.as_bytes()).unwrap_or(f64::NAN))
+                .collect()
+        } else {
+            self.data.to_vec()
+        }
     }
 
     /// Surfaces curve data based on the active output format.
     #[getter]
     pub fn data(&self, py: Python<'_>) -> PyResult<PyObject> {
+        if let Some(ref text_vec) = self.text_data {
+            let py_list = PyList::new(py, text_vec.as_slice())?;
+            return Ok(py_list.into());
+        }
         match self.output_format {
             OutputFormat::NumPy => match self.to_numpy(py) {
                 Ok(arr) => Ok(arr),
-                Err(_) => Ok(self.as_bytes(py).into()),
+                Err(_) => Ok(self.as_bytes(py)?.into()),
             },
-            OutputFormat::Bytes => Ok(self.as_bytes(py).into()),
+            OutputFormat::Bytes => Ok(self.as_bytes(py)?.into()),
             OutputFormat::List => {
                 let py_list = PyList::new(py, self.data.as_slice())?;
                 Ok(py_list.into())
@@ -314,6 +383,11 @@ impl LasCurve {
     /// Provides NumPy `__array_interface__` dictionary for zero-copy wrapping.
     #[getter]
     pub fn __array_interface__(&self, py: Python<'_>) -> PyResult<PyObject> {
+        if self.is_string() {
+            return Err(PyTypeError::new_err(
+                "Cannot construct float64 __array_interface__ for string curve",
+            ));
+        }
         let ptr = self.data.as_ptr() as usize;
         let dict = PyDict::new(py);
         dict.set_item("shape", (self.data.len(),))?;
@@ -344,25 +418,33 @@ impl LasCurve {
     }
 
     pub fn __len__(&self) -> usize {
-        self.data.len()
+        self.num_rows()
     }
 
     #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
-    pub fn __getitem__(&self, idx: isize) -> PyResult<f64> {
-        let len = self.data.len() as isize;
+    pub fn __getitem__(&self, py: Python<'_>, idx: isize) -> PyResult<PyObject> {
+        let len = self.num_rows() as isize;
         let norm = if idx < 0 { idx + len } else { idx };
-        if norm >= 0 && (norm as usize) < self.data.len() {
-            Ok(self.data[norm as usize])
+        if norm >= 0 && (norm as usize) < self.num_rows() {
+            if let Some(ref text_vec) = self.text_data {
+                let py_str = pyo3::types::PyString::new(py, &text_vec[norm as usize]);
+                Ok(py_str.into_any().unbind())
+            } else {
+                let py_float = pyo3::types::PyFloat::new(py, self.data[norm as usize]);
+                Ok(py_float.into_any().unbind())
+            }
         } else {
             Err(PyIndexError::new_err(format!(
                 "Curve sample index {idx} out of range (curve has {} samples)",
-                self.data.len()
+                self.num_rows()
             )))
         }
     }
 
     pub fn __repr__(&self) -> String {
-        let unit_part = if self.unit.is_empty() {
+        let unit_part = if self.is_string() {
+            " [TEXT]".to_string()
+        } else if self.unit.is_empty() {
             String::new()
         } else {
             format!(" [{}]", self.unit)
@@ -371,7 +453,7 @@ impl LasCurve {
             "<LasCurve {}{}: {} samples>",
             self.mnemonic,
             unit_part,
-            self.data.len()
+            self.num_rows()
         )
     }
 
@@ -433,7 +515,12 @@ impl LasWell {
     ) -> Self {
         let mut lookup = HashMap::with_capacity(data.num_columns());
         for (idx, name) in data.column_names().iter().enumerate() {
-            lookup.insert(normalize_mnemonic(name), idx);
+            let norm = normalize_mnemonic(name);
+            if lookup.contains_key(&norm) {
+                lookup.insert(format!("{norm}_{idx}"), idx);
+            } else {
+                lookup.insert(norm, idx);
+            }
         }
 
         let curves = curve_items.unwrap_or_else(|| {
@@ -443,10 +530,14 @@ impl LasWell {
                 .collect()
         });
 
-        // Also index mnemonics from curve items if present
+        // Also index mnemonics from curve items if present, handling duplicate mnemonics in permissive mode
         for (idx, item) in curves.iter().enumerate() {
             let norm = normalize_mnemonic(item.mnemonic());
-            lookup.entry(norm).or_insert(idx);
+            if lookup.contains_key(&norm) {
+                lookup.insert(format!("{norm}_{idx}"), idx);
+            } else {
+                lookup.insert(norm, idx);
+            }
         }
 
         Self {
@@ -462,6 +553,52 @@ impl LasWell {
             definition_sections,
             delimiter,
         }
+    }
+
+    /// Accesses the inner columnar buffer.
+    #[must_use]
+    pub fn inner_data(&self) -> &ColumnarBuffer {
+        &self.data
+    }
+
+    /// Accesses parsed well items.
+    #[must_use]
+    pub fn well_items(&self) -> &[HeaderItem] {
+        &self.well_items
+    }
+
+    /// Accesses parsed version items.
+    #[must_use]
+    pub fn version_items(&self) -> &[HeaderItem] {
+        &self.version_items
+    }
+
+    /// Accesses parsed curve items.
+    #[must_use]
+    pub fn curve_items(&self) -> &[HeaderItem] {
+        &self.curve_items
+    }
+
+    /// Accesses parsed parameter items.
+    #[must_use]
+    pub fn parameter_items(&self) -> &[HeaderItem] {
+        &self.parameter_items
+    }
+
+    /// Accesses raw lines from ~Other section.
+    #[must_use]
+    pub fn other_lines(&self) -> &[String] {
+        &self.other_lines
+    }
+
+    /// Returns a [`ColumnarBuffer`] for a specific section (e.g. "CORE", "LOG").
+    #[must_use]
+    pub fn section_data_buffer(&self, name: &str) -> Option<ColumnarBuffer> {
+        let upper = name.trim().to_ascii_uppercase();
+        if upper == "LOG" || upper == "CURVE" || upper == "ASCII" {
+            return Some(self.data.clone());
+        }
+        self.data_sections.get(&upper).cloned()
     }
 
     /// Creates a new `LasWell` from a columnar buffer and metadata collections.
@@ -617,6 +754,13 @@ impl LasWell {
 
     /// Surfaces curve data based on the active output format.
     pub(crate) fn export_column(&self, py: Python<'_>, col_idx: usize) -> PyResult<PyObject> {
+        if self.data.is_string_column(col_idx) {
+            let col = self.data.column_text(col_idx).ok_or_else(|| {
+                PyIndexError::new_err(format!("Column index {col_idx} out of range"))
+            })?;
+            let py_list = PyList::new(py, col)?;
+            return Ok(py_list.into());
+        }
         match self.output_format {
             OutputFormat::NumPy => self.export_column_numpy(py, col_idx),
             OutputFormat::Bytes => {
@@ -799,11 +943,20 @@ impl LasWell {
     /// Retrieves an individual curve as a rich [`LasCurve`] object.
     pub fn curve(&self, key: &Bound<'_, PyAny>) -> PyResult<LasCurve> {
         let idx = self.resolve_column_index(key)?;
-        let col = self
-            .data
-            .column_arc(idx)
-            .ok_or_else(|| PyIndexError::new_err(format!("Column index {idx} out of range")))?;
         let name = &self.data.column_names()[idx];
+        let is_str = self.data.is_string_column(idx);
+        let text_data = if is_str {
+            self.data.column_text_arc(idx)
+        } else {
+            None
+        };
+        let col = if is_str {
+            Arc::new(Vec::new())
+        } else {
+            self.data
+                .column_arc(idx)
+                .ok_or_else(|| PyIndexError::new_err(format!("Column index {idx} out of range")))?
+        };
 
         let (unit, val, desc) = if let Some(item) = self.curve_items.get(idx) {
             (
@@ -815,7 +968,10 @@ impl LasWell {
             (String::new(), String::new(), String::new())
         };
 
-        Ok(LasCurve::new(name, unit, val, desc, idx, col).with_output_format(self.output_format))
+        Ok(
+            LasCurve::new_with_text(name, unit, val, desc, idx, col, text_data)
+                .with_output_format(self.output_format),
+        )
     }
 
     /// Returns a dictionary mapping curve mnemonics to rich [`LasCurve`] objects.
@@ -823,11 +979,20 @@ impl LasWell {
     pub fn curves(&self) -> HashMap<String, LasCurve> {
         let mut map = HashMap::with_capacity(self.data.num_columns());
         for i in 0..self.data.num_columns() {
-            let col = self
-                .data
-                .column_arc(i)
-                .unwrap_or_else(|| Arc::new(Vec::new()));
             let name = &self.data.column_names()[i];
+            let is_str = self.data.is_string_column(i);
+            let text_data = if is_str {
+                self.data.column_text_arc(i)
+            } else {
+                None
+            };
+            let col = if is_str {
+                Arc::new(Vec::new())
+            } else {
+                self.data
+                    .column_arc(i)
+                    .unwrap_or_else(|| Arc::new(Vec::new()))
+            };
             let (unit, val, desc) = if let Some(item) = self.curve_items.get(i) {
                 (
                     item.unit().to_string(),
@@ -837,8 +1002,8 @@ impl LasWell {
             } else {
                 (String::new(), String::new(), String::new())
             };
-            let c =
-                LasCurve::new(name, unit, val, desc, i, col).with_output_format(self.output_format);
+            let c = LasCurve::new_with_text(name, unit, val, desc, i, col, text_data)
+                .with_output_format(self.output_format);
             map.insert(name.clone(), c);
         }
         map
@@ -918,6 +1083,12 @@ impl LasWell {
         py: Python<'py>,
         key: &Bound<'_, PyAny>,
     ) -> PyResult<Bound<'py, PyMemoryView>> {
+        let idx = self.resolve_column_index(key)?;
+        if self.data.is_string_column(idx) {
+            return Err(PyTypeError::new_err(
+                "Cannot construct float64 memoryview for string curve",
+            ));
+        }
         let py_bytes = self.curve_bytes(py, key)?;
         PyMemoryView::from(&py_bytes)
     }
@@ -948,13 +1119,7 @@ impl LasWell {
 
     /// Exports all curves to a list of float lists (one list per column).
     pub fn to_list(&self) -> Vec<Vec<f64>> {
-        let mut list = Vec::with_capacity(self.data.num_columns());
-        for idx in 0..self.data.num_columns() {
-            if let Some(col) = self.data.column(idx) {
-                list.push(col.to_vec());
-            }
-        }
-        list
+        self.data.to_list()
     }
 
     /// Exports the well data as a 2D NumPy array `(num_rows, num_columns)` or dict of 1D arrays.
@@ -964,16 +1129,52 @@ impl LasWell {
         py_buf.to_numpy(py, as_dict)
     }
 
-    /// Exports all curves to a dictionary mapping curve names to lists of floats in column order.
+    /// Exports all curves to a dictionary mapping curve names to lists of values in column order.
     pub fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let dict = PyDict::new(py);
-        for (idx, name) in self.data.column_names().iter().enumerate() {
-            if let Some(col) = self.data.column(idx) {
-                let py_list = PyList::new(py, col)?;
-                dict.set_item(name, py_list)?;
-            }
+        self.data.to_dict(py)
+    }
+
+    /// Serializes this well log to a standard CWLS LAS formatted file or string.
+    ///
+    /// If `destination` is provided as a string, writes directly to that filepath.
+    /// If `destination` is None, returns the LAS file content as a Python `str`.
+    #[pyo3(signature = (
+        destination = None,
+        version = 2.0,
+        wrap = false,
+        delimiter = None,
+        float_precision = 4,
+        null_value = None
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn write(
+        &self,
+        py: Python<'_>,
+        destination: Option<&str>,
+        version: f64,
+        wrap: bool,
+        delimiter: Option<String>,
+        float_precision: usize,
+        null_value: Option<f64>,
+    ) -> PyResult<PyObject> {
+        let options = crate::writer::WriteOptions {
+            version,
+            wrap,
+            delimiter,
+            float_precision,
+            null_value: null_value.unwrap_or_else(|| self.null_value().unwrap_or(-999.25)),
+        };
+
+        if let Some(path) = destination {
+            crate::writer::write_las_file(self, path, &options)
+                .map_err(|e| PyValueError::new_err(format!("Failed to write LAS file: {e}")))?;
+            Ok(py.None())
+        } else {
+            let content = crate::writer::write_las_string(self, &options)
+                .map_err(|e| PyValueError::new_err(format!("Failed to format LAS string: {e}")))?;
+            let py_str = pyo3::types::PyString::new(py, &content);
+            Ok(py_str.into_any().unbind())
         }
-        Ok(dict)
     }
 
     /// Whether this file is detected or confirmed as CWLS LAS 3.0.
@@ -1312,7 +1513,7 @@ pub fn parse_las_bytes(
                         || sec_name == "CURVE"
                         || (primary_columnar.is_none() && data_sections.is_empty());
 
-                    let section_curves: Vec<String> = if is_primary && !curve_items.is_empty() {
+                    let mut section_curves: Vec<String> = if is_primary && !curve_items.is_empty() {
                         curve_items
                             .iter()
                             .map(|c| c.mnemonic().to_string())
@@ -1327,6 +1528,20 @@ pub fn parse_las_bytes(
                     } else {
                         Vec::new()
                     };
+
+                    if section_curves.is_empty() && !delimiter.title().is_empty() {
+                        let tokens: Vec<String> = delimiter
+                            .title()
+                            .split_whitespace()
+                            .map(str::to_string)
+                            .collect();
+                        if !tokens.is_empty() {
+                            for t in &tokens {
+                                curve_items.push(HeaderItem::new_item(t, "", "", "", line_no, ""));
+                            }
+                            section_curves = tokens;
+                        }
+                    }
 
                     let data_bytes = &bytes[data_start..];
                     let (buf, consumed) = if !section_curves.is_empty() {
@@ -1559,6 +1774,39 @@ pub fn read_las(
             "source must be a file path string, raw LAS text string, or bytes",
         ))
     }
+}
+
+/// Standalone convenience function to serialize a LAS well to a file or string.
+#[pyfunction]
+#[pyo3(name = "write_las", signature = (
+    well,
+    destination = None,
+    version = 2.0,
+    wrap = false,
+    delimiter = None,
+    float_precision = 4,
+    null_value = None
+))]
+#[allow(clippy::too_many_arguments)]
+pub fn write_las(
+    py: Python<'_>,
+    well: &LasWell,
+    destination: Option<&str>,
+    version: f64,
+    wrap: bool,
+    delimiter: Option<String>,
+    float_precision: usize,
+    null_value: Option<f64>,
+) -> PyResult<PyObject> {
+    well.write(
+        py,
+        destination,
+        version,
+        wrap,
+        delimiter,
+        float_precision,
+        null_value,
+    )
 }
 
 #[cfg(test)]
