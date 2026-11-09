@@ -372,6 +372,8 @@ pub struct SectionStateMachine {
     null_sentinel: NullSentinel,
     /// Whether the NULL sentinel was dynamically detected from header records.
     is_null_detected: bool,
+    /// Whether this file is detected or configured as CWLS LAS 3.0.
+    is_las3: bool,
 }
 
 impl Default for SectionStateMachine {
@@ -395,6 +397,7 @@ impl SectionStateMachine {
             current_delimiter: None,
             null_sentinel: NullSentinel::default_cwls(),
             is_null_detected: false,
+            is_las3: false,
         }
     }
 
@@ -494,6 +497,24 @@ impl SectionStateMachine {
         self.is_null_detected
     }
 
+    /// Returns whether this state machine is configured for or detected as CWLS LAS 3.0.
+    #[must_use]
+    pub const fn is_las3(&self) -> bool {
+        self.is_las3
+    }
+
+    /// Sets whether this state machine handles CWLS LAS 3.0 rules.
+    pub fn set_las3(&mut self, is_las3: bool) {
+        self.is_las3 = is_las3;
+    }
+
+    /// Builder method to configure LAS 3.0 mode.
+    #[must_use]
+    pub const fn with_las3(mut self, is_las3: bool) -> Self {
+        self.is_las3 = is_las3;
+        self
+    }
+
     /// Returns the current section's delimiter metadata.
     #[must_use]
     pub fn current_delimiter(&self) -> Option<&SectionDelimiter> {
@@ -528,34 +549,76 @@ impl SectionStateMachine {
                 });
             }
 
-            // Rule 2: No section delimiter may follow ~A (Ascii)
-            if self.state == State::Ascii {
-                return Err(StateMachineError::SectionAfterAscii {
-                    section: target,
-                    line_number: target_line,
-                });
+            // Check if delimiter indicates a LAS 3.0 section
+            let name_upper = delimiter.section_name().to_ascii_uppercase();
+            if name_upper == "LOG"
+                || name_upper == "CORE"
+                || name_upper == "INCLINOMETRY"
+                || name_upper == "TOPS"
+                || name_upper == "DRILLING"
+                || name_upper == "TEST"
+                || delimiter
+                    .raw_line()
+                    .to_ascii_uppercase()
+                    .contains("_DEFINITION")
+                || delimiter.raw_line().to_ascii_uppercase().contains("_DATA")
+                || delimiter
+                    .raw_line()
+                    .to_ascii_uppercase()
+                    .contains("-DEFINITION")
+                || delimiter.raw_line().to_ascii_uppercase().contains("-DATA")
+            {
+                self.is_las3 = true;
             }
 
-            // Rule 3: Sections cannot be duplicated
-            if self.has_seen(target) {
-                return Err(StateMachineError::DuplicateSection {
-                    section: target,
-                    line_number: target_line,
-                });
-            }
+            if self.is_las3 {
+                // LAS 3.0 rules:
+                // Rule 2: ~Version and ~Well cannot be duplicated
+                if (target == SectionType::Version || target == SectionType::Well)
+                    && self.has_seen(target)
+                {
+                    return Err(StateMachineError::DuplicateSection {
+                        section: target,
+                        line_number: target_line,
+                    });
+                }
 
-            // Rule 4: ~A requires ~C (Curve) to have been defined
-            if target == SectionType::Ascii && !self.has_seen(SectionType::Curve) {
-                return Err(StateMachineError::AsciiBeforeCurve {
-                    line_number: target_line,
-                });
-            }
+                // Rule 3: Data sections require ~Well to have been seen
+                if target == SectionType::Ascii && !self.has_seen(SectionType::Well) {
+                    return Err(StateMachineError::MissingRequiredSections {
+                        missing: vec![SectionType::Well],
+                    });
+                }
+            } else {
+                // Rule 2: No section delimiter may follow ~A (Ascii) in LAS 2.0
+                if self.state == State::Ascii {
+                    return Err(StateMachineError::SectionAfterAscii {
+                        section: target,
+                        line_number: target_line,
+                    });
+                }
 
-            // Rule 5: ~A requires ~W (Well) to have been seen
-            if target == SectionType::Ascii && !self.has_seen(SectionType::Well) {
-                return Err(StateMachineError::MissingRequiredSections {
-                    missing: vec![SectionType::Well],
-                });
+                // Rule 3: Sections cannot be duplicated in LAS 2.0
+                if self.has_seen(target) {
+                    return Err(StateMachineError::DuplicateSection {
+                        section: target,
+                        line_number: target_line,
+                    });
+                }
+
+                // Rule 4: ~A requires ~C (Curve) to have been defined
+                if target == SectionType::Ascii && !self.has_seen(SectionType::Curve) {
+                    return Err(StateMachineError::AsciiBeforeCurve {
+                        line_number: target_line,
+                    });
+                }
+
+                // Rule 5: ~A requires ~W (Well) to have been seen
+                if target == SectionType::Ascii && !self.has_seen(SectionType::Well) {
+                    return Err(StateMachineError::MissingRequiredSections {
+                        missing: vec![SectionType::Well],
+                    });
+                }
             }
         }
 
@@ -808,6 +871,18 @@ impl SectionStateMachine {
     #[getter]
     fn get_is_in_data_section(&self) -> bool {
         self.is_in_data_section()
+    }
+
+    /// Returns `true` if state machine is configured for or detected as CWLS LAS 3.0.
+    #[getter]
+    fn get_is_las3(&self) -> bool {
+        self.is_las3
+    }
+
+    /// Sets whether state machine follows CWLS LAS 3.0 transition rules.
+    #[setter]
+    fn set_is_las3(&mut self, is_las3: bool) {
+        self.is_las3 = is_las3;
     }
 
     /// Returns `true` if state machine reached completed state.

@@ -7,7 +7,7 @@ Validates parser compliance against real-world well log edge cases:
 - Custom delimiter variants (spaces, tabs, mixed whitespace, CRLF)
 - Mixed null sentinels and IEEE 754 quiet NaN mapping
 - Zero-copy decoding integrity across UTF-8, BOM, and Windows-1252 (CP1252)
-- Channel ordering and PyArrow / NumPy export integrity
+- Channel ordering and native List / NumPy export integrity
 """
 
 from __future__ import annotations
@@ -17,7 +17,6 @@ import math
 from pathlib import Path
 
 import numpy as np
-import pyarrow as pa  # type: ignore[import-untyped]
 import pytest
 from turbolas import (
     LasCurve,
@@ -388,25 +387,14 @@ class TestDiverseHeaders:
 
 
 class TestExportsAndIngestionSources:
-    """Tests whole-table PyArrow / NumPy exports and diverse ingestion sources."""
+    """Tests whole-table native List / NumPy exports and diverse ingestion sources."""
 
-    def test_arrow_table_export(self, cwls_12_well: LasWell) -> None:
-        table = cwls_12_well.to_arrow()
-        assert isinstance(table, pa.Table)
-        assert table.num_rows == 5
-        assert table.num_columns == 8
-        assert table.schema.names == [
-            "DEPT",
-            "DT",
-            "RHOB",
-            "NPHI",
-            "SFLU",
-            "SFLA",
-            "ILM",
-            "ILD",
-        ]
-        for field in table.schema:
-            assert field.type == pa.float64()
+    def test_to_list_export(self, cwls_12_well: LasWell) -> None:
+        cols = cwls_12_well.to_list()
+        assert isinstance(cols, list)
+        assert len(cols) == 8
+        assert len(cols[0]) == 5
+        assert pytest.approx(cols[0][0]) == 1670.0
 
     def test_numpy_2d_export(self, cwls_12_well: LasWell) -> None:
         matrix = cwls_12_well.to_numpy()
@@ -444,18 +432,23 @@ class TestExportsAndIngestionSources:
             well_from_file = read_las(f)
             assert well_from_file.num_rows == 5
 
-    def test_output_format_arrow_and_bytes(self) -> None:
-        well = read_las(DATA_DIR / "cwls_12_canonical.las", output_format="arrow")
-        assert well.output_format == "arrow"
-        dept_pa = well["DEPT"]
-        assert isinstance(dept_pa, pa.Array)
-        assert len(dept_pa) == 5
+    def test_output_format_list_and_bytes(self) -> None:
+        well = read_las(DATA_DIR / "cwls_12_canonical.las", output_format="list")
+        assert well.output_format == "list"
+        dept_list = well["DEPT"]
+        assert isinstance(dept_list, list)
+        assert len(dept_list) == 5
 
         well.output_format = OutputFormat.Bytes
         assert well.output_format == "bytes"
         dept_bytes = well["DEPT"]
         assert isinstance(dept_bytes, bytes)
         assert len(dept_bytes) == 5 * 8
+
+        # Test memoryview export
+        mv = well.curve_memoryview("DEPT")
+        assert isinstance(mv, memoryview)
+        assert mv.nbytes == 5 * 8
 
     def test_validation_mode_propagation(self) -> None:
         well = read_las(

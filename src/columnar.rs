@@ -35,7 +35,7 @@
 
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
-use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::encoding::PyDecodedBuffer;
 use crate::error::{DataError, LASDataError};
@@ -89,7 +89,7 @@ pub fn is_text_null_sentinel(token: &[u8], sentinel: Option<&NullSentinel>) -> b
 /// Contiguous columnar buffer storing parsed `f64` values per curve.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ColumnarBuffer {
-    columns: Vec<Vec<f64>>,
+    columns: Vec<Arc<Vec<f64>>>,
     column_names: Vec<String>,
     num_rows: usize,
 }
@@ -99,7 +99,7 @@ impl ColumnarBuffer {
     #[must_use]
     pub fn new(num_columns: usize, capacity: usize) -> Self {
         let columns = (0..num_columns)
-            .map(|_| Vec::with_capacity(capacity))
+            .map(|_| Arc::new(Vec::with_capacity(capacity)))
             .collect();
         let column_names = (0..num_columns).map(|i| format!("COL_{i}")).collect();
         Self {
@@ -114,7 +114,7 @@ impl ColumnarBuffer {
     pub fn with_names(column_names: Vec<String>, capacity: usize) -> Self {
         let num_columns = column_names.len();
         let columns = (0..num_columns)
-            .map(|_| Vec::with_capacity(capacity))
+            .map(|_| Arc::new(Vec::with_capacity(capacity)))
             .collect();
         Self {
             columns,
@@ -127,6 +127,21 @@ impl ColumnarBuffer {
     #[must_use]
     pub fn from_raw_parts(
         columns: Vec<Vec<f64>>,
+        column_names: Vec<String>,
+        num_rows: usize,
+    ) -> Self {
+        let arc_columns = columns.into_iter().map(Arc::new).collect();
+        Self {
+            columns: arc_columns,
+            column_names,
+            num_rows,
+        }
+    }
+
+    /// Constructs a `ColumnarBuffer` directly from shared `Arc<Vec<f64>>` columns.
+    #[must_use]
+    pub fn from_arc_columns(
+        columns: Vec<Arc<Vec<f64>>>,
         column_names: Vec<String>,
         num_rows: usize,
     ) -> Self {
@@ -170,12 +185,18 @@ impl ColumnarBuffer {
     /// Returns a slice of the column at the given index, if within bounds.
     #[must_use]
     pub fn column(&self, index: usize) -> Option<&[f64]> {
-        self.columns.get(index).map(Vec::as_slice)
+        self.columns.get(index).map(|col| col.as_slice())
+    }
+
+    /// Returns a shared reference (`Arc`) to the column at the given index, if within bounds.
+    #[must_use]
+    pub fn column_arc(&self, index: usize) -> Option<Arc<Vec<f64>>> {
+        self.columns.get(index).cloned()
     }
 
     /// Returns a mutable reference to the column vector at the given index.
     pub fn column_mut(&mut self, index: usize) -> Option<&mut Vec<f64>> {
-        self.columns.get_mut(index)
+        self.columns.get_mut(index).map(Arc::make_mut)
     }
 
     /// Finds the index of a column matching `name` (case-insensitive).
@@ -193,15 +214,15 @@ impl ColumnarBuffer {
         self.column_index(name).and_then(|idx| self.column(idx))
     }
 
-    /// Returns all column vectors as a slice of vectors.
+    /// Returns all column vectors as a slice of shared vectors.
     #[must_use]
-    pub fn columns(&self) -> &[Vec<f64>] {
+    pub fn columns(&self) -> &[Arc<Vec<f64>>] {
         &self.columns
     }
 
     /// Consumes the buffer and returns the inner column vectors.
     #[must_use]
-    pub fn into_columns(self) -> Vec<Vec<f64>> {
+    pub fn into_columns(self) -> Vec<Arc<Vec<f64>>> {
         self.columns
     }
 
@@ -224,7 +245,7 @@ impl ColumnarBuffer {
             });
         }
         for (col, &val) in self.columns.iter_mut().zip(row.iter()) {
-            col.push(val);
+            Arc::make_mut(col).push(val);
         }
         self.num_rows += 1;
         Ok(())
@@ -452,6 +473,14 @@ impl ColumnarParser {
     /// Returns `DataError::IncompleteRow` if EOF is reached with a partial row.
     /// Returns `DataError::EmptyData` if strict mode is enabled and no rows were parsed.
     pub fn parse_bytes(&self, bytes: &[u8]) -> Result<ColumnarBuffer, DataError> {
+        self.parse_bytes_with_consumed(bytes).map(|(buf, _)| buf)
+    }
+
+    /// Parses columnar data from a byte slice, returning the buffer and bytes consumed.
+    pub fn parse_bytes_with_consumed(
+        &self,
+        bytes: &[u8],
+    ) -> Result<(ColumnarBuffer, usize), DataError> {
         if self.num_columns == 0 {
             return Err(DataError::NoColumnsDefined);
         }
@@ -464,7 +493,8 @@ impl ColumnarParser {
             if let Some(ref sentinel) = self.null_sentinel {
                 unwrapper = unwrapper.with_null_sentinel(sentinel.clone());
             }
-            return unwrapper.parse_to_columnar();
+            let buf = unwrapper.parse_to_columnar()?;
+            return Ok((buf, bytes.len()));
         }
 
         let capacity = self.estimate_capacity(bytes.len());
@@ -684,11 +714,15 @@ impl ColumnarParser {
             (0..self.num_columns).map(|i| format!("COL_{i}")).collect()
         };
 
-        Ok(ColumnarBuffer {
-            columns,
-            column_names: names,
-            num_rows,
-        })
+        let arc_columns = columns.into_iter().map(Arc::new).collect();
+        Ok((
+            ColumnarBuffer {
+                columns: arc_columns,
+                column_names: names,
+                num_rows,
+            },
+            pos,
+        ))
     }
 
     /// Parses ASCII log data from a string slice (`&str`).
@@ -829,15 +863,16 @@ impl PyColumnarBuffer {
         })
     }
 
-    /// Exports all columns to a dictionary mapping column names to lists of floats.
-    pub fn to_dict(&self) -> HashMap<String, Vec<f64>> {
-        let mut map = HashMap::with_capacity(self.inner.num_columns());
+    /// Exports all columns to a dictionary mapping column names to lists of floats in column order.
+    pub fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let dict = PyDict::new(py);
         for (idx, name) in self.inner.column_names().iter().enumerate() {
             if let Some(col) = self.inner.column(idx) {
-                map.insert(name.clone(), col.to_vec());
+                let py_list = PyList::new(py, col)?;
+                dict.set_item(name, py_list)?;
             }
         }
-        map
+        Ok(dict)
     }
 
     /// Counts the number of `NaN` / missing values in the specified column.
@@ -975,69 +1010,15 @@ impl PyColumnarBuffer {
         Ok(matrix.into())
     }
 
-    /// Exports to an Apache Arrow `Table` via zero-copy buffer sharing.
-    #[pyo3(signature = ())]
-    pub fn to_arrow(&self, py: Python<'_>) -> PyResult<PyObject> {
-        let Ok(pa) = py.import("pyarrow") else {
-            return Err(pyo3::exceptions::PyImportError::new_err(
-                "pyarrow is required for to_arrow(); install with 'pip install pyarrow'",
-            ));
-        };
-
-        let arrays = PyList::empty(py);
-        let num_rows = self.inner.num_rows();
-
-        for col_idx in 0..self.inner.num_columns() {
-            if let Some(bytes) = self.inner.column_bytes(col_idx) {
-                let py_bytes = PyBytes::new(py, bytes);
-                let py_buf = pa.call_method1("py_buffer", (py_bytes,))?;
-                let float64_type = pa.call_method0("float64")?;
-                let none_val = py.None();
-                let buffers = (none_val, py_buf);
-                let arr = pa
-                    .getattr("Array")?
-                    .call_method1("from_buffers", (float64_type, num_rows, buffers))?;
-                arrays.append(arr)?;
+    /// Exports all columns to a list of float lists.
+    pub fn to_list(&self) -> Vec<Vec<f64>> {
+        let mut list = Vec::with_capacity(self.inner.num_columns());
+        for idx in 0..self.inner.num_columns() {
+            if let Some(col) = self.inner.column(idx) {
+                list.push(col.to_vec());
             }
         }
-
-        let names = self.inner.column_names();
-        let table = pa
-            .getattr("Table")?
-            .call_method1("from_arrays", (arrays, names))?;
-
-        Ok(table.into())
-    }
-
-    /// Exports to a Polars `DataFrame`.
-    #[pyo3(signature = ())]
-    pub fn to_polars(&self, py: Python<'_>) -> PyResult<PyObject> {
-        let Ok(pl) = py.import("polars") else {
-            return Err(pyo3::exceptions::PyImportError::new_err(
-                "polars is required for to_polars(); install with 'pip install polars'",
-            ));
-        };
-        let arrow_table = self.to_arrow(py)?;
-        let df = pl.call_method1("from_arrow", (arrow_table,))?;
-        Ok(df.into())
-    }
-
-    /// Exports to a Pandas `DataFrame`.
-    #[pyo3(signature = ())]
-    pub fn to_pandas(&self, py: Python<'_>) -> PyResult<PyObject> {
-        if let Ok(arrow_table) = self.to_arrow(py) {
-            if let Ok(df) = arrow_table.call_method0(py, "to_pandas") {
-                return Ok(df);
-            }
-        }
-        let Ok(pd) = py.import("pandas") else {
-            return Err(pyo3::exceptions::PyImportError::new_err(
-                "pandas or pyarrow is required for to_pandas(); install with 'pip install pandas'",
-            ));
-        };
-        let dict = self.to_dict();
-        let df = pd.call_method1("DataFrame", (dict,))?;
-        Ok(df.into())
+        list
     }
 
     pub fn __len__(&self) -> usize {

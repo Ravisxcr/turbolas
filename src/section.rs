@@ -148,36 +148,6 @@ impl SectionType {
             }),
         }
     }
-
-    /// Matches known section keywords (e.g. `"VERSION"`, `"CURVES"`) to find the keyword length.
-    fn match_keyword_len(text: &str, section: Self) -> usize {
-        let upper = text.to_ascii_uppercase();
-        let candidates: &[&str] = match section {
-            Self::Version => &["VERSION", "VERS", "V"],
-            Self::Well => &["WELL", "W"],
-            Self::Curve => &["CURVES", "CURVE", "CURV", "C"],
-            Self::Parameter => &["PARAMETERS", "PARAMETER", "PARAMS", "PARAM", "P"],
-            Self::Other => &["OTHERS", "OTHER", "O"],
-            Self::Ascii => &["ASCII", "A"],
-        };
-
-        for &cand in candidates {
-            if upper.starts_with(cand) {
-                // Ensure boundary: next character should be whitespace, end of string, or non-alphanumeric
-                let cand_len = cand.len();
-                if cand_len == upper.len() {
-                    return cand_len;
-                }
-                if let Some(next_char) = upper[cand_len..].chars().next() {
-                    if next_char.is_whitespace() || !next_char.is_alphabetic() {
-                        return cand_len;
-                    }
-                }
-            }
-        }
-        // Fallback to first char if no multi-letter word matched with boundary
-        1
-    }
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -252,12 +222,225 @@ impl fmt::Display for SectionType {
     }
 }
 
+/// Parses a section header following the leading `~` character.
+///
+/// Supports CWLS LAS 1.2, 2.0 (`~V`, `~W`, `~C`, `~P`, `~O`, `~A`)
+/// and LAS 3.0 compound section naming conventions (`~Log_Definition`, `~Log_Data`,
+/// `~Core_Definition`, `~Core_Data`, `~Inclinometry_Parameter`, etc.).
+///
+/// Returns a tuple of `(SectionType, section_name, title)`.
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn parse_section_header(after_tilde: &str) -> Option<(SectionType, String, String)> {
+    let trimmed = after_tilde.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // Split on first whitespace or '|' to separate keyword from title/remarks
+    let (kw_str, title_str) = match trimmed.split_once(|c: char| c.is_whitespace() || c == '|') {
+        Some((kw, rest)) => (kw.trim(), rest.trim().trim_start_matches('|').trim()),
+        None => (trimmed, ""),
+    };
+
+    let kw_upper = kw_str.to_ascii_uppercase();
+
+    // 1. Check for LAS 3.0 compound suffixes (_Definition, -Definition, .Definition, _Data, etc.)
+    let def_pos = kw_upper
+        .find("_DEFINITION")
+        .or_else(|| kw_upper.find("-DEFINITION"))
+        .or_else(|| kw_upper.find(".DEFINITION"))
+        .or_else(|| kw_upper.find("_DEF"))
+        .or_else(|| kw_upper.find("-DEF"))
+        .or_else(|| kw_upper.find(".DEF"));
+    if let Some(pos) = def_pos {
+        let sec_name = &kw_str[..pos];
+        return Some((
+            SectionType::Curve,
+            sec_name.to_ascii_uppercase(),
+            title_str.to_string(),
+        ));
+    }
+
+    let data_pos = kw_upper
+        .find("_DATA")
+        .or_else(|| kw_upper.find("-DATA"))
+        .or_else(|| kw_upper.find(".DATA"));
+    if let Some(pos) = data_pos {
+        let sec_name = &kw_str[..pos];
+        return Some((
+            SectionType::Ascii,
+            sec_name.to_ascii_uppercase(),
+            title_str.to_string(),
+        ));
+    }
+
+    let param_pos = kw_upper
+        .find("_PARAMETER")
+        .or_else(|| kw_upper.find("-PARAMETER"))
+        .or_else(|| kw_upper.find(".PARAMETER"))
+        .or_else(|| kw_upper.find("_PARAM"))
+        .or_else(|| kw_upper.find("-PARAM"))
+        .or_else(|| kw_upper.find(".PARAM"));
+    if let Some(pos) = param_pos {
+        let sec_name = &kw_str[..pos];
+        return Some((
+            SectionType::Parameter,
+            sec_name.to_ascii_uppercase(),
+            title_str.to_string(),
+        ));
+    }
+
+    // 2. Standard CWLS 1.2 / 2.0 section prefixes
+    if kw_upper.starts_with('V') {
+        let title = if kw_upper.starts_with("VERSION") {
+            let rem = kw_str["VERSION".len()..].trim();
+            if rem.is_empty() {
+                title_str.to_string()
+            } else {
+                format!("{rem} {title_str}").trim().to_string()
+            }
+        } else if kw_upper.starts_with("VERS") {
+            let rem = kw_str["VERS".len()..].trim();
+            if rem.is_empty() {
+                title_str.to_string()
+            } else {
+                format!("{rem} {title_str}").trim().to_string()
+            }
+        } else {
+            let rem = kw_str[1..].trim();
+            if rem.is_empty() {
+                title_str.to_string()
+            } else {
+                format!("{rem} {title_str}").trim().to_string()
+            }
+        };
+        return Some((SectionType::Version, "VERSION".to_string(), title));
+    }
+    if kw_upper.starts_with('W') {
+        let title = if kw_upper.starts_with("WELL") {
+            let rem = kw_str["WELL".len()..].trim();
+            if rem.is_empty() {
+                title_str.to_string()
+            } else {
+                format!("{rem} {title_str}").trim().to_string()
+            }
+        } else {
+            let rem = kw_str[1..].trim();
+            if rem.is_empty() {
+                title_str.to_string()
+            } else {
+                format!("{rem} {title_str}").trim().to_string()
+            }
+        };
+        return Some((SectionType::Well, "WELL".to_string(), title));
+    }
+    if kw_upper.starts_with('C') && !kw_upper.contains('_') && !kw_upper.contains('-') {
+        let title = if kw_upper.starts_with("CURVES") {
+            let rem = kw_str["CURVES".len()..].trim();
+            if rem.is_empty() {
+                title_str.to_string()
+            } else {
+                format!("{rem} {title_str}").trim().to_string()
+            }
+        } else if kw_upper.starts_with("CURVE") {
+            let rem = kw_str["CURVE".len()..].trim();
+            if rem.is_empty() {
+                title_str.to_string()
+            } else {
+                format!("{rem} {title_str}").trim().to_string()
+            }
+        } else {
+            let rem = kw_str[1..].trim();
+            if rem.is_empty() {
+                title_str.to_string()
+            } else {
+                format!("{rem} {title_str}").trim().to_string()
+            }
+        };
+        return Some((SectionType::Curve, "CURVE".to_string(), title));
+    }
+    if kw_upper.starts_with('P') && !kw_upper.contains('_') && !kw_upper.contains('-') {
+        let title = if kw_upper.starts_with("PARAMETERS") {
+            let rem = kw_str["PARAMETERS".len()..].trim();
+            if rem.is_empty() {
+                title_str.to_string()
+            } else {
+                format!("{rem} {title_str}").trim().to_string()
+            }
+        } else if kw_upper.starts_with("PARAMETER") {
+            let rem = kw_str["PARAMETER".len()..].trim();
+            if rem.is_empty() {
+                title_str.to_string()
+            } else {
+                format!("{rem} {title_str}").trim().to_string()
+            }
+        } else if kw_upper.starts_with("PARAMS") {
+            let rem = kw_str["PARAMS".len()..].trim();
+            if rem.is_empty() {
+                title_str.to_string()
+            } else {
+                format!("{rem} {title_str}").trim().to_string()
+            }
+        } else {
+            let rem = kw_str[1..].trim();
+            if rem.is_empty() {
+                title_str.to_string()
+            } else {
+                format!("{rem} {title_str}").trim().to_string()
+            }
+        };
+        return Some((SectionType::Parameter, "PARAMETER".to_string(), title));
+    }
+    if kw_upper.starts_with('O') && !kw_upper.contains('_') && !kw_upper.contains('-') {
+        let title = if kw_upper.starts_with("OTHER") {
+            let rem = kw_str["OTHER".len()..].trim();
+            if rem.is_empty() {
+                title_str.to_string()
+            } else {
+                format!("{rem} {title_str}").trim().to_string()
+            }
+        } else {
+            let rem = kw_str[1..].trim();
+            if rem.is_empty() {
+                title_str.to_string()
+            } else {
+                format!("{rem} {title_str}").trim().to_string()
+            }
+        };
+        return Some((SectionType::Other, "OTHER".to_string(), title));
+    }
+    if kw_upper.starts_with('A') && !kw_upper.contains('_') && !kw_upper.contains('-') {
+        let title = if kw_upper.starts_with("ASCII") {
+            let rem = kw_str["ASCII".len()..].trim();
+            if rem.is_empty() {
+                title_str.to_string()
+            } else {
+                format!("{rem} {title_str}").trim().to_string()
+            }
+        } else {
+            let rem = kw_str[1..].trim();
+            if rem.is_empty() {
+                title_str.to_string()
+            } else {
+                format!("{rem} {title_str}").trim().to_string()
+            }
+        };
+        return Some((SectionType::Ascii, "ASCII".to_string(), title));
+    }
+
+    // Unrecognized section delimiter
+    None
+}
+
 /// Represents a parsed CWLS LAS section delimiter line.
 #[pyclass]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SectionDelimiter {
     /// The identified section type.
     section_type: SectionType,
+    /// Logical section name (e.g. "LOG", "CORE", "CURVE", "ASCII", "VERSION").
+    section_name: String,
     /// 1-based line number in the source file.
     line_number: usize,
     /// The raw line text as read from the source.
@@ -269,14 +452,34 @@ pub struct SectionDelimiter {
 impl SectionDelimiter {
     /// Creates a new `SectionDelimiter`.
     #[must_use]
-    pub const fn new(
+    pub fn new(
         section_type: SectionType,
+        line_number: usize,
+        raw_line: String,
+        title: String,
+    ) -> Self {
+        let section_name = section_type.name().to_string();
+        Self {
+            section_type,
+            section_name,
+            line_number,
+            raw_line,
+            title,
+        }
+    }
+
+    /// Creates a new `SectionDelimiter` with an explicit section name.
+    #[must_use]
+    pub fn with_section_name(
+        section_type: SectionType,
+        section_name: impl Into<String>,
         line_number: usize,
         raw_line: String,
         title: String,
     ) -> Self {
         Self {
             section_type,
+            section_name: section_name.into(),
             line_number,
             raw_line,
             title,
@@ -287,6 +490,12 @@ impl SectionDelimiter {
     #[must_use]
     pub const fn section_type(&self) -> SectionType {
         self.section_type
+    }
+
+    /// Returns the logical section name (e.g. `"LOG"`, `"CORE"`, `"VERSION"`).
+    #[must_use]
+    pub fn section_name(&self) -> &str {
+        &self.section_name
     }
 
     /// Returns the 1-based line number where the delimiter appeared.
@@ -331,7 +540,6 @@ impl SectionDelimiter {
     ///
     /// Returns `StateMachineError::InvalidDelimiter` if the line does not start with `~`
     /// or has no character following `~`.
-    /// Returns `StateMachineError::UnknownSection` if the section character is not a valid CWLS code.
     pub fn parse(line: &str, line_number: usize) -> Result<Self, StateMachineError> {
         let trimmed_start = line.trim_start();
         if !trimmed_start.starts_with('~') {
@@ -344,23 +552,27 @@ impl SectionDelimiter {
 
         let after_tilde = &trimmed_start[1..];
         let content = after_tilde.trim_start();
-        let Some(first_char) = content.chars().next() else {
-            return Err(StateMachineError::InvalidDelimiter {
+        let Some((section_type, section_name, title)) = parse_section_header(content) else {
+            if content.is_empty() {
+                return Err(StateMachineError::InvalidDelimiter {
+                    line_number,
+                    line: line.to_string(),
+                    reason: "missing section character after '~'".to_string(),
+                });
+            }
+            let first_char = content.chars().next().unwrap_or('?');
+            return Err(StateMachineError::UnknownSection {
+                code: first_char.to_ascii_uppercase(),
                 line_number,
-                line: line.to_string(),
-                reason: "missing section character after '~'".to_string(),
+                raw: line.to_string(),
             });
         };
-        let section_type = SectionType::from_char(first_char, line_number, line)?;
-
-        let kw_len = SectionType::match_keyword_len(content, section_type);
-        let remainder = &content[kw_len..];
-        let title = remainder.trim().to_string();
 
         let clean_raw = line.trim_end_matches(['\r', '\n']).to_string();
 
         Ok(Self {
             section_type,
+            section_name,
             line_number,
             raw_line: clean_raw,
             title,
@@ -389,6 +601,12 @@ impl SectionDelimiter {
     #[getter]
     fn get_section_type(&self) -> SectionType {
         self.section_type
+    }
+
+    /// Returns the logical section name (e.g. "LOG", "CORE", "VERSION").
+    #[getter]
+    fn get_section_name(&self) -> &str {
+        &self.section_name
     }
 
     /// Returns the character code of the section.

@@ -7,7 +7,6 @@ import math
 from pathlib import Path
 
 import numpy as np
-import pyarrow as pa  # type: ignore[import-untyped]
 import pytest
 from turbolas import (
     LasCurve,
@@ -205,23 +204,6 @@ def test_mapping_protocol(sample_well: LasWell) -> None:
     assert sample_well.get("MISSING", 999.0) == 999.0
 
 
-def test_arrow_output_format(sample_well: LasWell) -> None:
-    sample_well.output_format = "arrow"
-    assert sample_well.output_format == "arrow"
-
-    gr_pa = sample_well["GR"]
-    assert isinstance(gr_pa, pa.Array)
-    assert gr_pa.type == pa.float64()
-    assert len(gr_pa) == 3
-    assert gr_pa[0].as_py() == 45.2
-    assert gr_pa[1].as_py() == 48.7
-    assert math.isnan(gr_pa[2].as_py())
-
-    # Switch back to numpy
-    sample_well.output_format = "numpy"
-    assert isinstance(sample_well["GR"], np.ndarray)
-
-
 def test_bytes_and_list_output_formats(sample_well: LasWell) -> None:
     sample_well.output_format = "bytes"
     b = sample_well["DEPT"]
@@ -241,8 +223,9 @@ def test_explicit_curve_accessors(sample_well: LasWell) -> None:
     arr_np = sample_well.curve_numpy("GR")
     assert isinstance(arr_np, np.ndarray)
 
-    arr_pa = sample_well.curve_arrow("GR")
-    assert isinstance(arr_pa, pa.Array)
+    mv = sample_well.curve_memoryview("GR")
+    assert isinstance(mv, memoryview)
+    assert mv.nbytes == 3 * 8
 
     raw_b = sample_well.curve_bytes("GR")
     assert isinstance(raw_b, bytes)
@@ -276,6 +259,16 @@ def test_rich_las_curve_object(sample_well: LasWell) -> None:
     assert isinstance(np_arr, np.ndarray)
     assert pytest.approx(np_arr[0]) == 45.2
 
+    # as_memoryview
+    mv = curve.as_memoryview()
+    assert isinstance(mv, memoryview)
+    assert mv.nbytes == 3 * 8
+
+    # to_list
+    lst = curve.to_list()
+    assert lst[:2] == [45.2, 48.7]
+    assert math.isnan(lst[2])
+
     # curves property returning dict
     curves_dict = sample_well.curves
     assert "DEPT" in curves_dict
@@ -285,13 +278,6 @@ def test_rich_las_curve_object(sample_well: LasWell) -> None:
 
 
 def test_whole_table_exports(sample_well: LasWell) -> None:
-    # PyArrow Table
-    table = sample_well.to_arrow()
-    assert isinstance(table, pa.Table)
-    assert table.num_rows == 3
-    assert table.num_columns == 3
-    assert table.column_names == ["DEPT", "GR", "RHOB"]
-
     # 2D NumPy array
     matrix = sample_well.to_numpy()
     assert isinstance(matrix, np.ndarray)
@@ -308,11 +294,17 @@ def test_whole_table_exports(sample_well: LasWell) -> None:
     assert isinstance(py_dict, dict)
     assert py_dict["DEPT"] == [1000.0, 1000.5, 1001.0]
 
+    # Python list of column lists
+    col_lists = sample_well.to_list()
+    assert isinstance(col_lists, list)
+    assert len(col_lists) == 3
+    assert col_lists[0] == [1000.0, 1000.5, 1001.0]
+
     # Optional DataFrame libraries if installed
     try:
         import polars as pl  # type: ignore[import-not-found,import-untyped]
 
-        df_pl = sample_well.to_polars()
+        df_pl = pl.DataFrame(sample_well.to_dict())
         assert isinstance(df_pl, pl.DataFrame)
         assert df_pl.shape == (3, 3)
     except ImportError:
@@ -321,7 +313,7 @@ def test_whole_table_exports(sample_well: LasWell) -> None:
     try:
         import pandas as pd  # type: ignore[import-untyped]
 
-        df_pd = sample_well.to_pandas()
+        df_pd = pd.DataFrame(sample_well.to_dict())
         assert isinstance(df_pd, pd.DataFrame)
         assert df_pd.shape == (3, 3)
     except ImportError:

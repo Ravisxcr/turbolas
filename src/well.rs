@@ -24,8 +24,9 @@
 
 use pyo3::exceptions::{PyIndexError, PyKeyError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyList};
+use pyo3::types::{PyBytes, PyDict, PyList, PyMemoryView};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::columnar::{ColumnarBuffer, ColumnarParser, PyColumnarBuffer};
 use crate::encoding::decode_buffer;
@@ -33,7 +34,7 @@ use crate::error::{LASDataError, LASHeaderError, LASSectionError};
 use crate::header::HeaderItem;
 use crate::null::{NullPolicy, NullSentinel};
 use crate::section::SectionType;
-use crate::state_machine::{SectionStateMachine, ValidationMode};
+use crate::state_machine::{LineAction, SectionStateMachine, ValidationMode};
 use crate::unwrapper;
 
 /// Output representation format for exported curve data.
@@ -43,8 +44,6 @@ pub enum OutputFormat {
     /// Export curve data as an exported 1D NumPy array (`float64`).
     #[default]
     NumPy,
-    /// Export curve data as an Apache Arrow `Array` (`pa.float64()`).
-    Arrow,
     /// Export raw contiguous IEEE 754 64-bit little-endian bytes (`bytes`).
     Bytes,
     /// Export curve data as a standard Python `list[float]`.
@@ -56,7 +55,6 @@ impl OutputFormat {
     fn __repr__(&self) -> String {
         match self {
             Self::NumPy => "OutputFormat.NumPy".to_string(),
-            Self::Arrow => "OutputFormat.Arrow".to_string(),
             Self::Bytes => "OutputFormat.Bytes".to_string(),
             Self::List => "OutputFormat.List".to_string(),
         }
@@ -81,7 +79,7 @@ pub struct LasCurve {
     value: String,
     description: String,
     column_index: usize,
-    data: Vec<f64>,
+    data: Arc<Vec<f64>>,
     output_format: OutputFormat,
 }
 
@@ -94,7 +92,7 @@ impl LasCurve {
         value: impl Into<String>,
         description: impl Into<String>,
         column_index: usize,
-        data: Vec<f64>,
+        data: impl Into<Arc<Vec<f64>>>,
     ) -> Self {
         Self {
             mnemonic: mnemonic.into(),
@@ -102,7 +100,7 @@ impl LasCurve {
             value: value.into(),
             description: description.into(),
             column_index,
-            data,
+            data: data.into(),
             output_format: OutputFormat::NumPy,
         }
     }
@@ -117,6 +115,19 @@ impl LasCurve {
 
 #[pymethods]
 impl LasCurve {
+    /// Creates a new `LasCurve` instance.
+    #[new]
+    #[pyo3(signature = (mnemonic, unit = "", value = "", description = "", column_index = 0, data = vec![]))]
+    pub fn py_new(
+        mnemonic: &str,
+        unit: &str,
+        value: &str,
+        description: &str,
+        column_index: usize,
+        data: Vec<f64>,
+    ) -> Self {
+        Self::new(mnemonic, unit, value, description, column_index, data)
+    }
     /// Curve mnemonic identifier (e.g. `"GR"`, `"DEPT"`).
     #[getter]
     pub fn mnemonic(&self) -> &str {
@@ -141,10 +152,57 @@ impl LasCurve {
         &self.description
     }
 
+    /// Alias for description (compatible with `lasio.descr`).
+    #[getter]
+    pub fn descr(&self) -> &str {
+        &self.description
+    }
+
     /// Zero-based column offset in the raw columnar matrix.
     #[getter]
     pub fn column_index(&self) -> usize {
         self.column_index
+    }
+
+    /// Current output format preference for .data.
+    #[getter]
+    pub fn output_format(&self) -> String {
+        match self.output_format {
+            OutputFormat::NumPy => "numpy".to_string(),
+            OutputFormat::Bytes => "bytes".to_string(),
+            OutputFormat::List => "list".to_string(),
+        }
+    }
+
+    /// Sets the output format preference for .data.
+    #[setter]
+    pub fn set_output_format(&mut self, format: &Bound<'_, PyAny>) -> PyResult<()> {
+        if let Ok(s) = format.extract::<&str>() {
+            self.output_format = parse_output_format_str(s)?;
+            Ok(())
+        } else if let Ok(fmt) = format.extract::<OutputFormat>() {
+            self.output_format = fmt;
+            Ok(())
+        } else {
+            Err(PyTypeError::new_err(
+                "output_format must be a string or OutputFormat enum",
+            ))
+        }
+    }
+
+    /// Returns a copy of the curve with the specified output format.
+    #[pyo3(name = "with_output_format")]
+    pub fn py_with_output_format(&self, format: &Bound<'_, PyAny>) -> Result<LasCurve, PyErr> {
+        let fmt = if let Ok(s) = format.extract::<&str>() {
+            parse_output_format_str(s)?
+        } else if let Ok(f) = format.extract::<OutputFormat>() {
+            f
+        } else {
+            return Err(PyTypeError::new_err(
+                "output_format must be a string or OutputFormat enum",
+            ));
+        };
+        Ok(self.clone().with_output_format(fmt))
     }
 
     /// Number of sample rows in this curve.
@@ -169,7 +227,7 @@ impl LasCurve {
         let mut min = f64::INFINITY;
         let mut max = f64::NEG_INFINITY;
         let mut found = false;
-        for &val in &self.data {
+        for &val in self.data.iter() {
             if !val.is_nan() {
                 if val < min {
                     min = val;
@@ -191,7 +249,7 @@ impl LasCurve {
     pub fn mean(&self) -> Option<f64> {
         let mut sum = 0.0;
         let mut count = 0usize;
-        for &val in &self.data {
+        for &val in self.data.iter() {
             if !val.is_nan() {
                 sum += val;
                 count += 1;
@@ -226,23 +284,15 @@ impl LasCurve {
         Ok(arr.into())
     }
 
-    /// Exports curve data as a zero-copy Apache Arrow `Array`.
-    pub fn to_arrow(&self, py: Python<'_>) -> PyResult<PyObject> {
-        let pa = py.import("pyarrow")?;
+    /// Exports curve data as a zero-copy Python `memoryview`.
+    pub fn as_memoryview<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyMemoryView>> {
         let py_bytes = self.as_bytes(py);
-        let py_buf = pa.call_method1("py_buffer", (py_bytes,))?;
-        let float64_type = pa.call_method0("float64")?;
-        let none_val = py.None();
-        let buffers = (none_val, py_buf);
-        let arr = pa
-            .getattr("Array")?
-            .call_method1("from_buffers", (float64_type, self.data.len(), buffers))?;
-        Ok(arr.into())
+        PyMemoryView::from(&py_bytes)
     }
 
     /// Exports curve data as a Python `list[float]`.
     pub fn to_list(&self) -> Vec<f64> {
-        self.data.clone()
+        self.data.to_vec()
     }
 
     /// Surfaces curve data based on the active output format.
@@ -251,18 +301,11 @@ impl LasCurve {
         match self.output_format {
             OutputFormat::NumPy => match self.to_numpy(py) {
                 Ok(arr) => Ok(arr),
-                Err(_) => match self.to_arrow(py) {
-                    Ok(arr) => Ok(arr),
-                    Err(_) => Ok(self.as_bytes(py).into()),
-                },
-            },
-            OutputFormat::Arrow => match self.to_arrow(py) {
-                Ok(arr) => Ok(arr),
-                Err(_) => self.to_numpy(py),
+                Err(_) => Ok(self.as_bytes(py).into()),
             },
             OutputFormat::Bytes => Ok(self.as_bytes(py).into()),
             OutputFormat::List => {
-                let py_list = PyList::new(py, &self.data)?;
+                let py_list = PyList::new(py, self.data.as_slice())?;
                 Ok(py_list.into())
             }
         }
@@ -352,24 +395,31 @@ pub struct LasWell {
     pub(crate) data: ColumnarBuffer,
     /// Fast case-insensitive ASCII lookup map: uppercase trimmed mnemonic -> column index.
     pub(crate) lookup: HashMap<String, usize>,
-    /// Curve metadata items from ~C (Curve) section, in column order.
+    /// Curve metadata items from ~C (Curve) or ~Log_Definition section, in column order.
     pub(crate) curve_items: Vec<HeaderItem>,
     /// Well information items from ~W (Well) section.
     pub(crate) well_items: Vec<HeaderItem>,
     /// Version information items from ~V (Version) section.
     pub(crate) version_items: Vec<HeaderItem>,
-    /// Parameter information items from ~P (Parameter) section.
+    /// Parameter information items from ~P (Parameter) or ~Log_Parameter section.
     pub(crate) parameter_items: Vec<HeaderItem>,
     /// Other non-structured comments / text lines from ~O (Other) section.
     pub(crate) other_lines: Vec<String>,
     /// Output format preference for curve lookups.
     pub(crate) output_format: OutputFormat,
+    /// Additional data sections in LAS 3.0 (e.g. "CORE", "INCLINOMETRY", "TOPS").
+    pub(crate) data_sections: HashMap<String, ColumnarBuffer>,
+    /// Additional definition sections in LAS 3.0 (e.g. "CORE", "TOPS").
+    pub(crate) definition_sections: HashMap<String, Vec<HeaderItem>>,
+    /// Delimiter specified by DLM item in ~V (e.g. "COMMA", "SPACE", "TAB").
+    pub(crate) delimiter: Option<String>,
 }
 
 impl LasWell {
-    /// Creates a new `LasWell` from a columnar buffer and metadata collections.
+    /// Creates a new `LasWell` with support for LAS 3.0 multi-section data.
     #[must_use]
-    pub fn new(
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_sections(
         data: ColumnarBuffer,
         curve_items: Option<Vec<HeaderItem>>,
         well_items: Option<Vec<HeaderItem>>,
@@ -377,6 +427,9 @@ impl LasWell {
         parameter_items: Option<Vec<HeaderItem>>,
         other_lines: Option<Vec<String>>,
         output_format: OutputFormat,
+        data_sections: HashMap<String, ColumnarBuffer>,
+        definition_sections: HashMap<String, Vec<HeaderItem>>,
+        delimiter: Option<String>,
     ) -> Self {
         let mut lookup = HashMap::with_capacity(data.num_columns());
         for (idx, name) in data.column_names().iter().enumerate() {
@@ -405,7 +458,35 @@ impl LasWell {
             parameter_items: parameter_items.unwrap_or_default(),
             other_lines: other_lines.unwrap_or_default(),
             output_format,
+            data_sections,
+            definition_sections,
+            delimiter,
         }
+    }
+
+    /// Creates a new `LasWell` from a columnar buffer and metadata collections.
+    #[must_use]
+    pub fn new(
+        data: ColumnarBuffer,
+        curve_items: Option<Vec<HeaderItem>>,
+        well_items: Option<Vec<HeaderItem>>,
+        version_items: Option<Vec<HeaderItem>>,
+        parameter_items: Option<Vec<HeaderItem>>,
+        other_lines: Option<Vec<String>>,
+        output_format: OutputFormat,
+    ) -> Self {
+        Self::with_sections(
+            data,
+            curve_items,
+            well_items,
+            version_items,
+            parameter_items,
+            other_lines,
+            output_format,
+            HashMap::new(),
+            HashMap::new(),
+            None,
+        )
     }
 
     /// Resolves a curve mnemonic (case-insensitive ASCII) to a column index in $O(1)$ time.
@@ -529,62 +610,15 @@ impl LasWell {
             return Ok(arr.into());
         }
 
-        // Fallback: try PyArrow if numpy is not installed
-        if let Ok(pa) = py.import("pyarrow") {
-            let py_bytes = PyBytes::new(py, bytes);
-            let py_buf = pa.call_method1("py_buffer", (py_bytes,))?;
-            let float64_type = pa.call_method0("float64")?;
-            let none_val = py.None();
-            let buffers = (none_val, py_buf);
-            let arr = pa.getattr("Array")?.call_method1(
-                "from_buffers",
-                (float64_type, self.data.num_rows(), buffers),
-            )?;
-            return Ok(arr.into());
-        }
-
-        // If neither is installed, return PyBytes buffer
+        // If numpy is not installed, return PyBytes buffer
         let py_bytes = PyBytes::new(py, bytes);
         Ok(py_bytes.into())
-    }
-
-    /// Exports a column as a zero-copy PyArrow `Array`.
-    pub(crate) fn export_column_arrow(&self, py: Python<'_>, col_idx: usize) -> PyResult<PyObject> {
-        let bytes = self
-            .data
-            .column_bytes(col_idx)
-            .ok_or_else(|| PyIndexError::new_err(format!("Column index {col_idx} out of range")))?;
-        let num_rows = self.data.num_rows();
-
-        let Ok(pa) = py.import("pyarrow") else {
-            // Fallback to NumPy if PyArrow is not installed
-            if let Ok(np) = py.import("numpy") {
-                let dtype = np.getattr("float64")?;
-                let py_bytes = PyBytes::new(py, bytes);
-                let arr = np.call_method1("frombuffer", (py_bytes, &dtype))?;
-                return Ok(arr.into());
-            }
-            return Err(pyo3::exceptions::PyImportError::new_err(
-                "pyarrow is required for arrow output; install with 'pip install pyarrow'",
-            ));
-        };
-
-        let py_bytes = PyBytes::new(py, bytes);
-        let py_buf = pa.call_method1("py_buffer", (py_bytes,))?;
-        let float64_type = pa.call_method0("float64")?;
-        let none_val = py.None();
-        let buffers = (none_val, py_buf);
-        let arr = pa
-            .getattr("Array")?
-            .call_method1("from_buffers", (float64_type, num_rows, buffers))?;
-        Ok(arr.into())
     }
 
     /// Surfaces curve data based on the active output format.
     pub(crate) fn export_column(&self, py: Python<'_>, col_idx: usize) -> PyResult<PyObject> {
         match self.output_format {
             OutputFormat::NumPy => self.export_column_numpy(py, col_idx),
-            OutputFormat::Arrow => self.export_column_arrow(py, col_idx),
             OutputFormat::Bytes => {
                 let bytes = self.data.column_bytes(col_idx).ok_or_else(|| {
                     PyIndexError::new_err(format!("Column index {col_idx} out of range"))
@@ -767,7 +801,7 @@ impl LasWell {
         let idx = self.resolve_column_index(key)?;
         let col = self
             .data
-            .column(idx)
+            .column_arc(idx)
             .ok_or_else(|| PyIndexError::new_err(format!("Column index {idx} out of range")))?;
         let name = &self.data.column_names()[idx];
 
@@ -781,8 +815,7 @@ impl LasWell {
             (String::new(), String::new(), String::new())
         };
 
-        Ok(LasCurve::new(name, unit, val, desc, idx, col.to_vec())
-            .with_output_format(self.output_format))
+        Ok(LasCurve::new(name, unit, val, desc, idx, col).with_output_format(self.output_format))
     }
 
     /// Returns a dictionary mapping curve mnemonics to rich [`LasCurve`] objects.
@@ -790,7 +823,10 @@ impl LasWell {
     pub fn curves(&self) -> HashMap<String, LasCurve> {
         let mut map = HashMap::with_capacity(self.data.num_columns());
         for i in 0..self.data.num_columns() {
-            let col = self.data.column(i).unwrap_or(&[]);
+            let col = self
+                .data
+                .column_arc(i)
+                .unwrap_or_else(|| Arc::new(Vec::new()));
             let name = &self.data.column_names()[i];
             let (unit, val, desc) = if let Some(item) = self.curve_items.get(i) {
                 (
@@ -801,8 +837,8 @@ impl LasWell {
             } else {
                 (String::new(), String::new(), String::new())
             };
-            let c = LasCurve::new(name, unit, val, desc, i, col.to_vec())
-                .with_output_format(self.output_format);
+            let c =
+                LasCurve::new(name, unit, val, desc, i, col).with_output_format(self.output_format);
             map.insert(name.clone(), c);
         }
         map
@@ -849,7 +885,6 @@ impl LasWell {
     pub fn output_format(&self) -> String {
         match self.output_format {
             OutputFormat::NumPy => "numpy".to_string(),
-            OutputFormat::Arrow => "arrow".to_string(),
             OutputFormat::Bytes => "bytes".to_string(),
             OutputFormat::List => "list".to_string(),
         }
@@ -877,10 +912,14 @@ impl LasWell {
         self.export_column_numpy(py, idx)
     }
 
-    /// Explicitly surfaces a curve as a zero-copy PyArrow `Array`.
-    pub fn curve_arrow(&self, py: Python<'_>, key: &Bound<'_, PyAny>) -> PyResult<PyObject> {
-        let idx = self.resolve_column_index(key)?;
-        self.export_column_arrow(py, idx)
+    /// Explicitly surfaces a curve as a zero-copy Python `memoryview`.
+    pub fn curve_memoryview<'py>(
+        &self,
+        py: Python<'py>,
+        key: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyMemoryView>> {
+        let py_bytes = self.curve_bytes(py, key)?;
+        PyMemoryView::from(&py_bytes)
     }
 
     /// Explicitly surfaces a curve as raw contiguous IEEE 754 little-endian `bytes`.
@@ -907,22 +946,15 @@ impl LasWell {
         Ok(col.to_vec())
     }
 
-    /// Exports the entire well data matrix to an Apache Arrow `Table`.
-    pub fn to_arrow(&self, py: Python<'_>) -> PyResult<PyObject> {
-        let py_buf = PyColumnarBuffer::from_inner(self.data.clone());
-        py_buf.to_arrow(py)
-    }
-
-    /// Exports the entire well data matrix to a Polars `DataFrame`.
-    pub fn to_polars(&self, py: Python<'_>) -> PyResult<PyObject> {
-        let py_buf = PyColumnarBuffer::from_inner(self.data.clone());
-        py_buf.to_polars(py)
-    }
-
-    /// Exports the entire well data matrix to a Pandas `DataFrame`.
-    pub fn to_pandas(&self, py: Python<'_>) -> PyResult<PyObject> {
-        let py_buf = PyColumnarBuffer::from_inner(self.data.clone());
-        py_buf.to_pandas(py)
+    /// Exports all curves to a list of float lists (one list per column).
+    pub fn to_list(&self) -> Vec<Vec<f64>> {
+        let mut list = Vec::with_capacity(self.data.num_columns());
+        for idx in 0..self.data.num_columns() {
+            if let Some(col) = self.data.column(idx) {
+                list.push(col.to_vec());
+            }
+        }
+        list
     }
 
     /// Exports the well data as a 2D NumPy array `(num_rows, num_columns)` or dict of 1D arrays.
@@ -932,13 +964,88 @@ impl LasWell {
         py_buf.to_numpy(py, as_dict)
     }
 
-    /// Exports all curves to a dictionary mapping curve names to lists of floats.
-    pub fn to_dict(&self) -> HashMap<String, Vec<f64>> {
-        let mut map = HashMap::with_capacity(self.data.num_columns());
+    /// Exports all curves to a dictionary mapping curve names to lists of floats in column order.
+    pub fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let dict = PyDict::new(py);
         for (idx, name) in self.data.column_names().iter().enumerate() {
             if let Some(col) = self.data.column(idx) {
-                map.insert(name.clone(), col.to_vec());
+                let py_list = PyList::new(py, col)?;
+                dict.set_item(name, py_list)?;
             }
+        }
+        Ok(dict)
+    }
+
+    /// Whether this file is detected or confirmed as CWLS LAS 3.0.
+    #[getter]
+    pub fn is_las3(&self) -> bool {
+        self.version()
+            .map(|v| v.trim().starts_with("3."))
+            .unwrap_or(false)
+            || !self.data_sections.is_empty()
+    }
+
+    /// Delimiter specified by DLM in ~V (e.g. "COMMA", "SPACE", "TAB").
+    #[getter]
+    pub fn delimiter(&self) -> Option<String> {
+        self.delimiter.clone()
+    }
+
+    /// Names of all data sections present in the file (e.g. `["LOG", "CORE"]`).
+    #[getter]
+    pub fn section_names(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        if !self.data.is_empty() || !self.curve_items.is_empty() {
+            names.push("LOG".to_string());
+        }
+        for k in self.data_sections.keys() {
+            if !names.contains(k) {
+                names.push(k.clone());
+            }
+        }
+        names
+    }
+
+    /// Checks whether a specific data section exists (case-insensitive, e.g. "CORE").
+    pub fn has_section(&self, name: &str) -> bool {
+        let upper = name.trim().to_ascii_uppercase();
+        if upper == "LOG" || upper == "CURVE" || upper == "ASCII" {
+            return true;
+        }
+        self.data_sections.contains_key(&upper)
+    }
+
+    /// Returns a [`ColumnarBuffer`] for a specific section (e.g. "CORE", "LOG").
+    pub fn section_data(&self, name: &str) -> Option<PyColumnarBuffer> {
+        let upper = name.trim().to_ascii_uppercase();
+        if upper == "LOG" || upper == "CURVE" || upper == "ASCII" {
+            return Some(PyColumnarBuffer::from_inner(self.data.clone()));
+        }
+        self.data_sections
+            .get(&upper)
+            .cloned()
+            .map(PyColumnarBuffer::from_inner)
+    }
+
+    /// Returns curve definition items for a specific section (e.g. "CORE", "LOG").
+    pub fn section_curves(&self, name: &str) -> Option<Vec<HeaderItem>> {
+        let upper = name.trim().to_ascii_uppercase();
+        if upper == "LOG" || upper == "CURVE" || upper == "ASCII" {
+            return Some(self.curve_items.clone());
+        }
+        self.definition_sections.get(&upper).cloned()
+    }
+
+    /// Returns a dictionary of all additional section data buffers.
+    #[getter]
+    pub fn sections(&self) -> HashMap<String, PyColumnarBuffer> {
+        let mut map = HashMap::with_capacity(self.data_sections.len() + 1);
+        map.insert(
+            "LOG".to_string(),
+            PyColumnarBuffer::from_inner(self.data.clone()),
+        );
+        for (k, v) in &self.data_sections {
+            map.insert(k.clone(), PyColumnarBuffer::from_inner(v.clone()));
         }
         map
     }
@@ -1121,11 +1228,10 @@ impl LasWell {
 pub(crate) fn parse_output_format_str(format_str: &str) -> PyResult<OutputFormat> {
     match format_str.trim().to_ascii_lowercase().as_str() {
         "numpy" | "np" => Ok(OutputFormat::NumPy),
-        "arrow" | "pa" | "pyarrow" => Ok(OutputFormat::Arrow),
         "bytes" | "raw" | "buffer" => Ok(OutputFormat::Bytes),
         "list" => Ok(OutputFormat::List),
         other => Err(PyValueError::new_err(format!(
-            "Unsupported output format '{other}'; supported: 'numpy', 'arrow', 'bytes', 'list'"
+            "Unsupported output format '{other}'; supported: 'numpy', 'bytes', 'list'"
         ))),
     }
 }
@@ -1144,15 +1250,21 @@ pub fn parse_las_bytes(
     let val_mode = validation_mode.unwrap_or(ValidationMode::Permissive);
     let mut sm = SectionStateMachine::new(val_mode);
     let policy = null_policy.unwrap_or(NullPolicy::Strict);
+    let mut null_sentinel = NullSentinel::default_cwls().with_policy(policy);
 
-    let mut version_items = Vec::new();
-    let mut well_items = Vec::new();
-    let mut curve_items = Vec::new();
-    let mut parameter_items = Vec::new();
-    let mut other_lines = Vec::new();
+    let mut version_items: Vec<HeaderItem> = Vec::new();
+    let mut well_items: Vec<HeaderItem> = Vec::new();
+    let mut curve_items: Vec<HeaderItem> = Vec::new();
+    let mut parameter_items: Vec<HeaderItem> = Vec::new();
+    let mut other_lines: Vec<String> = Vec::new();
 
-    let mut in_ascii = false;
-    let mut ascii_start_offset = 0;
+    let mut definition_sections: HashMap<String, Vec<HeaderItem>> = HashMap::new();
+    let mut data_sections: HashMap<String, ColumnarBuffer> = HashMap::new();
+    let mut primary_columnar: Option<ColumnarBuffer> = None;
+
+    let mut is_wrapped = false;
+    let mut allow_commas = false;
+    let mut delimiter_str: Option<String> = None;
 
     let bytes = text.as_bytes();
     let len = bytes.len();
@@ -1185,14 +1297,80 @@ pub fn parse_las_bytes(
 
         // Check for section delimiter starting with ~
         if trimmed.starts_with('~') {
-            sm.process_line(trimmed)
+            let action = sm
+                .process_line(trimmed)
                 .map_err(|e| LASSectionError::new_err(format!("Line {line_no}: {e}")))?;
 
-            if let Some(sec) = sm.current_section() {
-                if sec == SectionType::Ascii {
-                    in_ascii = true;
-                    ascii_start_offset = next_line_start;
-                    break;
+            if let LineAction::SectionStart { section, delimiter } = action {
+                if section == SectionType::Ascii {
+                    let data_start = next_line_start;
+                    let sec_name = delimiter.section_name().to_ascii_uppercase();
+
+                    // Determine curve names for this data section
+                    let is_primary = sec_name == "LOG"
+                        || sec_name == "ASCII"
+                        || sec_name == "CURVE"
+                        || (primary_columnar.is_none() && data_sections.is_empty());
+
+                    let section_curves: Vec<String> = if is_primary && !curve_items.is_empty() {
+                        curve_items
+                            .iter()
+                            .map(|c| c.mnemonic().to_string())
+                            .collect()
+                    } else if let Some(defs) = definition_sections.get(&sec_name) {
+                        defs.iter().map(|c| c.mnemonic().to_string()).collect()
+                    } else if !curve_items.is_empty() {
+                        curve_items
+                            .iter()
+                            .map(|c| c.mnemonic().to_string())
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+
+                    let data_bytes = &bytes[data_start..];
+                    let (buf, consumed) = if !section_curves.is_empty() {
+                        if is_wrapped {
+                            let b = unwrapper::unwrap_and_parse(
+                                data_bytes,
+                                section_curves.len(),
+                                Some(section_curves.clone()),
+                                val_mode.is_strict(),
+                                allow_commas,
+                                Some(null_sentinel.clone()),
+                            )
+                            .map_err(|e| LASDataError::new_err(e.to_string()))?;
+                            (b, data_bytes.len())
+                        } else {
+                            let parser = ColumnarParser::new(section_curves.len())
+                                .with_column_names(section_curves.clone())
+                                .with_null_sentinel(null_sentinel.clone())
+                                .with_strict(val_mode.is_strict())
+                                .with_allow_commas(allow_commas);
+                            parser
+                                .parse_bytes_with_consumed(data_bytes)
+                                .map_err(|e| LASDataError::new_err(e.to_string()))?
+                        }
+                    } else {
+                        (
+                            ColumnarBuffer::with_names(section_curves, 0),
+                            data_bytes.len(),
+                        )
+                    };
+
+                    if is_primary && primary_columnar.is_none() {
+                        primary_columnar = Some(buf);
+                    } else {
+                        data_sections.insert(sec_name, buf);
+                    }
+
+                    // In LAS 2.0 / 1.2, no sections follow Ascii: break immediately
+                    if !sm.is_las3() {
+                        break;
+                    }
+
+                    line_start = data_start + consumed;
+                    continue;
                 }
             }
             line_start = next_line_start;
@@ -1210,9 +1388,36 @@ pub fn parse_las_bytes(
 
         // Process header records according to current section
         if let Some(sec) = sm.current_section() {
+            let current_sec_name = sm
+                .current_delimiter()
+                .map(|d| d.section_name().to_ascii_uppercase())
+                .unwrap_or_else(|| sec.name().to_string());
+
             match sec {
                 SectionType::Version => match HeaderItem::parse(line_str, line_no, val_mode) {
-                    Ok(item) => version_items.push(item),
+                    Ok(item) => {
+                        let mnem_upper = item.mnemonic().to_ascii_uppercase();
+                        if mnem_upper == "VERS" {
+                            if item.value().trim().starts_with('3') {
+                                sm.set_las3(true);
+                            }
+                        } else if mnem_upper == "WRAP" {
+                            is_wrapped = item.value().trim().eq_ignore_ascii_case("YES");
+                        } else if mnem_upper == "DLM" {
+                            let dlm_val = item.value().trim().to_ascii_uppercase();
+                            if dlm_val == "COMMA" || dlm_val == "," {
+                                allow_commas = true;
+                                delimiter_str = Some("COMMA".to_string());
+                            } else if dlm_val == "TAB" || dlm_val == "\\T" {
+                                delimiter_str = Some("TAB".to_string());
+                            } else if dlm_val == "SPACE" {
+                                delimiter_str = Some("SPACE".to_string());
+                            } else {
+                                delimiter_str = Some(item.value().trim().to_string());
+                            }
+                        }
+                        version_items.push(item);
+                    }
                     Err(e) => {
                         if val_mode.is_strict() {
                             return Err(LASHeaderError::new_err(format!("Line {line_no}: {e}")));
@@ -1220,7 +1425,15 @@ pub fn parse_las_bytes(
                     }
                 },
                 SectionType::Well => match HeaderItem::parse(line_str, line_no, val_mode) {
-                    Ok(item) => well_items.push(item),
+                    Ok(item) => {
+                        if item.mnemonic().eq_ignore_ascii_case("NULL") {
+                            let val_str = item.value().trim();
+                            if let Ok(val) = fast_float::parse::<f64, _>(val_str.as_bytes()) {
+                                null_sentinel = NullSentinel::new(val).with_policy(policy);
+                            }
+                        }
+                        well_items.push(item);
+                    }
                     Err(e) => {
                         if val_mode.is_strict() {
                             return Err(LASHeaderError::new_err(format!("Line {line_no}: {e}")));
@@ -1228,7 +1441,16 @@ pub fn parse_las_bytes(
                     }
                 },
                 SectionType::Curve => match HeaderItem::parse(line_str, line_no, val_mode) {
-                    Ok(item) => curve_items.push(item),
+                    Ok(item) => {
+                        if current_sec_name == "LOG" || current_sec_name == "CURVE" {
+                            curve_items.push(item);
+                        } else {
+                            definition_sections
+                                .entry(current_sec_name)
+                                .or_default()
+                                .push(item);
+                        }
+                    }
                     Err(e) => {
                         if val_mode.is_strict() {
                             return Err(LASHeaderError::new_err(format!("Line {line_no}: {e}")));
@@ -1246,75 +1468,48 @@ pub fn parse_las_bytes(
                 SectionType::Other => {
                     other_lines.push(line_str.to_string());
                 }
-                SectionType::Ascii => {
-                    in_ascii = true;
-                    ascii_start_offset = line_start;
-                    break;
-                }
+                SectionType::Ascii => {}
             }
         }
 
         line_start = next_line_start;
     }
 
-    // Extract curve names defined in ~C section
+    // Call finish on state machine
+    sm.finish()
+        .map_err(|e| LASSectionError::new_err(e.to_string()))?;
+
+    // If curve_items is empty but definition_sections has entries, promote first definition section
+    if curve_items.is_empty() {
+        if let Some((first_name, items)) = definition_sections.iter().next() {
+            let first_name = first_name.clone();
+            curve_items.clone_from(items);
+            if let Some(buf) = data_sections.remove(&first_name) {
+                primary_columnar = Some(buf);
+            }
+        }
+    }
+
+    // Extract curve names defined in primary curve section
     let curve_names: Vec<String> = curve_items
         .iter()
         .map(|c| c.mnemonic().to_string())
         .collect();
 
-    // Detect NULL value sentinel from ~W section
-    let null_sentinel = well_items
-        .iter()
-        .find(|item| item.mnemonic().eq_ignore_ascii_case("NULL"))
-        .and_then(|item| {
-            let val_str = item.value().trim();
-            fast_float::parse::<f64, _>(val_str.as_bytes()).ok()
-        })
-        .map(|val| NullSentinel::new(val).with_policy(policy))
-        .unwrap_or_else(|| NullSentinel::default_cwls().with_policy(policy));
+    let final_primary_buffer =
+        primary_columnar.unwrap_or_else(|| ColumnarBuffer::with_names(curve_names, 0));
 
-    // Detect WRAP flag from ~V section
-    let is_wrapped = version_items
-        .iter()
-        .find(|item| item.mnemonic().eq_ignore_ascii_case("WRAP"))
-        .map(|item| item.value().trim().eq_ignore_ascii_case("YES"))
-        .unwrap_or(false);
-
-    // Ingest ASCII numeric log data
-    let columnar_buffer = if in_ascii && !curve_names.is_empty() {
-        let ascii_bytes = &bytes[ascii_start_offset..];
-        if is_wrapped {
-            unwrapper::unwrap_and_parse(
-                ascii_bytes,
-                curve_names.len(),
-                Some(curve_names.clone()),
-                val_mode.is_strict(),
-                false,
-                Some(null_sentinel),
-            )
-            .map_err(|e| LASDataError::new_err(e.to_string()))?
-        } else {
-            let parser = ColumnarParser::new(curve_names.len())
-                .with_column_names(curve_names.clone())
-                .with_null_sentinel(null_sentinel)
-                .with_strict(val_mode.is_strict());
-            parser
-                .parse_bytes(ascii_bytes)
-                .map_err(|e| LASDataError::new_err(e.to_string()))?
-        }
-    } else {
-        ColumnarBuffer::with_names(curve_names, 0)
-    };
-
-    Ok(LasWell::new(
-        columnar_buffer,
+    Ok(LasWell::with_sections(
+        final_primary_buffer,
         Some(curve_items),
         Some(well_items),
         Some(version_items),
         Some(parameter_items),
         Some(other_lines),
         output_format,
+        data_sections,
+        definition_sections,
+        delimiter_str,
     ))
 }
 

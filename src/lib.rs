@@ -118,7 +118,6 @@ fn _turbolas(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     let out_fmt_cls = py.get_type::<OutputFormat>();
     out_fmt_cls.setattr("NUMPY", OutputFormat::NumPy)?;
-    out_fmt_cls.setattr("ARROW", OutputFormat::Arrow)?;
     out_fmt_cls.setattr("BYTES", OutputFormat::Bytes)?;
     out_fmt_cls.setattr("LIST", OutputFormat::List)?;
 

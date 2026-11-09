@@ -64,14 +64,14 @@ def read_las(
     """Reads and parses a CWLS LAS file into a `LasWell` instance.
 
     Provides ergonomic dictionary-like curve lookups (e.g. `well["GR"]`),
-    metadata accessors, and zero-copy export to NumPy, PyArrow, and Polars.
+    metadata accessors, and native export to NumPy, Python lists, bytes, and memoryviews.
 
     Args:
         source: File path, raw LAS text string, bytes, or file-like object with `.read()`.
         validation_mode: Validation mode (`ValidationMode.Strict` or `ValidationMode.Permissive`).
         null_policy: Policy for handling null sentinel values (`NullPolicy.Strict`, etc.).
         output_format: Target format for `well[mnemonic]` lookups
-            ('numpy', 'arrow', 'bytes', 'list').
+            ('numpy', 'bytes', 'list').
 
     Returns:
         A `LasWell` instance with complete curve data and header metadata.

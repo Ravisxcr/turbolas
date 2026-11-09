@@ -5,84 +5,171 @@
 [![Python: 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/)
 [![Rust: 1.75+](https://img.shields.io/badge/rust-1.75+-orange.svg)](https://www.rust-lang.org/)
 
-**TurboLAS** is a blazing-fast Python extension module for LAS (Log ASCII Standard) well log data, powered by Rust and PyO3.
+**TurboLAS** is an ultra-high-performance, zero-dependency Python extension module for reading and processing CWLS LAS (Log ASCII Standard) well log data (versions 1.2, 2.0, and 3.0), implemented in pure Rust via PyO3.
 
 ---
 
-## Project Structure
+## Key Highlights
 
-A clean, single-crate Python extension layout powered by [Maturin](https://www.maturin.rs/):
-
-```
-turbolas/
-├── Cargo.toml               # Rust package manifest (cdylib)
-├── pyproject.toml           # PEP 621 packaging & Maturin configuration
-├── rustfmt.toml             # Rust formatting configuration
-├── src/
-│   └── lib.rs               # Rust extension module implementation (PyO3)
-├── python/
-│   └── turbolas/
-│       ├── __init__.py      # Python package entry & version export
-│       ├── py.typed         # PEP 561 inline types marker
-│       └── _turbolas.pyi    # Type stubs for the native Rust extension
-├── tests/
-    └── test_basic.py        # Python test suite
-```
+- **Blazing Fast**: **60x to 300x+ faster** than traditional Python LAS parsers (e.g., `lasio`). Single-pass SIMD-accelerated columnar tokenization and zero-copy byte parsing.
+- **Zero Heavy Dependencies**: TurboLAS exports directly to native Python data types (`dict`, `list`, `memoryview`). No mandatory dependencies on PyArrow, Pandas, or Polars.
+- **Universal Interoperability**: Ingest data into any downstream DataFrame or array library with zero friction:
+  - **Polars**: `pl.DataFrame(well.to_dict())`
+  - **Pandas**: `pd.DataFrame(well.to_dict())`
+  - **NumPy**: `np.frombuffer(well.curve_memoryview("DEPT"), dtype=np.float64)`
+- **Complete CWLS Specification Compliance**:
+  - Full support for **CWLS LAS 1.2**, **2.0**, and **3.0**.
+  - Handles compound 3.0 sections (`~Log_Definition`, `~Log_Data`, `~Core_Definition`, `~Core_Data`, etc.).
+  - Automatic delimiter detection (`DLM . COMMA`, `SPACE`, `TAB`).
+  - Supports wrapped records (`WRAP. YES`), CRLF/LF line endings, and character encodings (ASCII, UTF-8, Windows-1252 / CP-1252).
+  - Configurable strict and permissive parsing modes with automatic null sentinel detection (`-999.25`, etc.).
 
 ---
 
-## Development Setup
+## Performance Benchmark
 
-### Prerequisites
+Benchmarked against `lasio` on real-world petrophysical well files:
 
-- **Rust toolchain** (1.75+): [rustup.rs](https://rustup.rs/)
-- **Python** (3.9+)
-- **Maturin**: Build tool for Rust-based Python extensions
+| Dataset / File | Rows × Curves | `lasio` Latency | `TurboLAS` Latency | Speedup |
+| :--- | :--- | :--- | :--- | :--- |
+| `4771-36-SESE.las` (LAS 2.0) | 9,996 × 2 | 21.22 ms | **0.34 ms** | **63x faster** |
+| `L9D_sp_001207.las` (LAS 3.0) | 9,249 × 2 | 335.09 ms | **1.08 ms** | **309x faster** |
 
-### Quickstart
-
-1. **Clone the repository:**
-   ```bash
-   git clone https://github.com/Ravisxcr/turbolas.git
-   cd turbolas
-   ```
-
-2. **Create and activate a virtual environment:**
-   ```bash
-   python -m venv .venv
-   # Windows:
-   .venv\Scripts\activate
-   # Linux/macOS:
-   source .venv/bin/activate
-   ```
-
-3. **Install development tools:**
-   ```bash
-   pip install maturin ruff pytest mypy
-   ```
-
-4. **Build and install in editable mode:**
-   ```bash
-   maturin develop
-   ```
+> *Note: For optimal parsing throughput, build in release mode via `maturin develop --release`.*
 
 ---
 
-## Testing & Quality Assurance
+## Installation & Quick Start
+
+### Installation
 
 ```bash
-# Rust formatting
+# Clone the repository
+git clone https://github.com/Ravisxcr/turbolas.git
+cd turbolas
+
+# Build & install in release mode
+maturin develop --release
+```
+
+### Basic Usage
+
+```python
+import turbolas
+
+# Read a LAS file (LAS 1.2, 2.0, or 3.0)
+well = turbolas.read("path/to/well.las")
+
+# Inspect well metadata
+print(f"Well: {well.well}")
+print(f"Company: {well.company}")
+print(f"Start / Stop Depth: {well.start} -> {well.stop} (step: {well.step})")
+print(f"Curves: {well.curve_mnemonics}")
+
+# Access curve data
+dept_curve = well.curves["DEPT"]
+print(f"Unit: {dept_curve.unit}, Description: {dept_curve.descr}")
+print(f"Min: {dept_curve.min}, Max: {dept_curve.max}, Null count: {dept_curve.null_count}")
+```
+
+---
+
+## Interoperability (Zero Dependencies)
+
+TurboLAS produces clean, native Python datatypes so you can load them directly into your favorite analytics framework:
+
+### 1. Polars
+
+```python
+import polars as pl
+import turbolas
+
+well = turbolas.read("well.las")
+
+# Ingest via native dictionary (preserves exact column ordering)
+df = pl.DataFrame(well.to_dict())
+print(df)
+```
+
+### 2. Pandas
+
+```python
+import pandas as pd
+import turbolas
+
+well = turbolas.read("well.las")
+
+df = pd.DataFrame(well.to_dict())
+print(df.head())
+```
+
+### 3. NumPy / Zero-Copy Memoryview
+
+```python
+import numpy as np
+import turbolas
+
+well = turbolas.read("well.las")
+
+# Direct zero-copy buffer view of IEEE 754 float64 curve data
+dept_array = np.frombuffer(well.curve_memoryview("DEPT"), dtype=np.float64)
+```
+
+### 4. Pure Python (No Libraries Needed)
+
+```python
+import turbolas
+
+well = turbolas.read("well.las")
+
+# Native Python dictionary: dict[str, list[float]]
+data_dict = well.to_dict()
+
+# Native 2D Python list: list[list[float]] (columns)
+data_columns = well.to_list()
+```
+
+---
+
+## CWLS LAS 3.0 Support
+
+CWLS LAS 3.0 introduces compound sections, custom delimiters, and multiple data sets (e.g. Wireline Log, Core, Inclinometry):
+
+```python
+import turbolas
+
+well = turbolas.read("las3_file.las")
+
+if well.is_las3:
+    print(f"LAS 3.0 Delimiter: {well.delimiter}")
+    print(f"Available sections: {well.section_names}")
+
+    # Access secondary sections (e.g., Core data)
+    if well.has_section("CORE"):
+        core_curves = well.section_curves("CORE")
+        core_data = well.section_data("CORE")  # dict[str, list[float]]
+        print(f"Core section curves: {core_curves}")
+```
+
+---
+
+## Development & Quality Assurance
+
+```bash
+# Rust tests (94 unit & integration tests)
+cargo test --target-dir target
+
+# Rust linter & formatter
+cargo clippy --target-dir target --all-targets
 cargo fmt --all --check
 
-# Rust linter
-cargo clippy --all-targets
+# Python tests (189 pytest tests)
+pytest
 
-# Python lint and formatting
+# Python linter & type checks
 ruff check .
 ruff format --check .
-
-# Run tests
-pytest
+mypy python/turbolas
 ```
 
 ---
