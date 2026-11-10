@@ -46,6 +46,7 @@ dev = [
 
 [project.urls]
 Homepage = "https://github.com/Ravisxcr/turbolas"
+Documentation = "https://github.com/Ravisxcr/turbolas/tree/main/docs"
 Repository = "https://github.com/Ravisxcr/turbolas"
 Issues = "https://github.com/Ravisxcr/turbolas/issues"
 

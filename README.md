@@ -1,11 +1,14 @@
 # TurboLAS
 
 [![CI](https://github.com/Ravisxcr/turbolas/actions/workflows/ci.yml/badge.svg)](https://github.com/Ravisxcr/turbolas/actions/workflows/ci.yml)
+[![Docs](https://img.shields.io/badge/docs-GitHub_Docs-blue.svg)](docs/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python: 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/)
 [![Rust: 1.75+](https://img.shields.io/badge/rust-1.75+-orange.svg)](https://www.rust-lang.org/)
 
 **TurboLAS** is an ultra-high-performance, zero-dependency Python extension module for reading and processing CWLS LAS (Log ASCII Standard) well log data (versions 1.2, 2.0, and 3.0), implemented in pure Rust via PyO3.
+
+*For complete guides and API details, visit the [TurboLAS Documentation](docs/).*
 
 ---
 
